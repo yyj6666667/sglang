@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.distributed
 
-from .parallel_state import get_tp_group
+from .parallel_state import get_moe_ep_group, get_moe_tp_group, get_tp_group
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
@@ -40,6 +40,16 @@ def tensor_model_parallel_gather(
 ) -> Optional[torch.Tensor]:
     """Gather the input tensor across model parallel group."""
     return get_tp_group().gather(input_, dst, dim)
+
+
+def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across moe tensor parallel group."""
+    return get_moe_tp_group().all_reduce(input_)
+
+
+def moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across moe expert parallel group."""
+    return get_moe_ep_group().all_reduce(input_)
 
 
 def broadcast_tensor_dict(

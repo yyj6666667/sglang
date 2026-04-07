@@ -27,9 +27,12 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -70,6 +73,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -219,7 +223,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_moe_tensor_parallel_world_size()
+        self.ep_size = get_moe_expert_parallel_world_size()
         self.layer_id = layer_id
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -303,13 +308,19 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
+
+        if self.ep_size > 1 and not should_allreduce_fusion:
+            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
+
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                final_hidden_states
+            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -559,7 +570,7 @@ class Qwen3MoeAttention(nn.Module):
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
         use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
         if use_fused:
-            theta = getattr(self.config, "rope_theta", 10000.0)
+            theta = self.rope_theta
             positions = (
                 positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
             )
@@ -681,8 +692,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
