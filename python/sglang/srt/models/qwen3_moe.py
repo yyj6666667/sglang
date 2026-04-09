@@ -946,20 +946,21 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        Qwen3MoeForCausalLM._debug_step += 1
-        if Qwen3MoeForCausalLM._debug_step <= 20:
-            _ids = input_ids.tolist() if input_ids.numel() <= 8 else input_ids[:8].tolist()
-            _pos = positions.tolist() if positions.numel() <= 8 else positions[:8].tolist()
-            _mode = getattr(forward_batch, "forward_mode", "?")
-            _seqlens = getattr(forward_batch, "seq_lens_cpu", None)
-            _seqlens_str = _seqlens.tolist() if _seqlens is not None else "?"
-            Qwen3MoeForCausalLM._debug_log.write(
-                f"[DBG step={Qwen3MoeForCausalLM._debug_step}] "
-                f"mode={_mode} "
-                f"input_ids={_ids} "
-                f"positions={_pos} "
-                f"seq_lens={_seqlens_str}\n"
-            )
+        if not torch.cuda.is_current_stream_capturing():
+            Qwen3MoeForCausalLM._debug_step += 1
+            if Qwen3MoeForCausalLM._debug_step <= 20:
+                _ids = input_ids[:8].cpu().tolist()
+                _pos = positions[:8].cpu().tolist()
+                _mode = getattr(forward_batch, "forward_mode", "?")
+                _seqlens = getattr(forward_batch, "seq_lens_cpu", None)
+                _seqlens_str = _seqlens.tolist() if _seqlens is not None else "?"
+                Qwen3MoeForCausalLM._debug_log.write(
+                    f"[DBG step={Qwen3MoeForCausalLM._debug_step}] "
+                    f"mode={_mode} "
+                    f"input_ids={_ids} "
+                    f"positions={_pos} "
+                    f"seq_lens={_seqlens_str}\n"
+                )
         hidden_states = self.model(
             input_ids,
             positions,
