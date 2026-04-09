@@ -819,6 +819,19 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
+        if not torch.cuda.is_current_stream_capturing():
+            hs = (hidden_states + residual).float() if residual is not None else hidden_states.float()
+            Qwen3MoeForCausalLM._debug_log.write(
+                f"[LAYER {self.layer_id}] "
+                f"norm={hs.norm().item():.4f} "
+                f"mean={hs.mean().item():.6f} "
+                f"std={hs.std().item():.6f} "
+                f"max={hs.max().item():.4f} "
+                f"min={hs.min().item():.4f} "
+                f"nan={hs.isnan().sum().item()} "
+                f"inf={hs.isinf().sum().item()}\n"
+            )
+
         return hidden_states, residual
 
     def op_comm_prepare_attn(
