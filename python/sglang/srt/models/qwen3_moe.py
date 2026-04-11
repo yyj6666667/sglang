@@ -997,6 +997,20 @@ class Qwen3MoeForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        if not torch.cuda.is_current_stream_capturing():
+            if Qwen3MoeForCausalLM._debug_step <= 20:
+                _hs = (hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states).float()
+                Qwen3MoeForCausalLM._debug_log.write(
+                    f"[DBG step={Qwen3MoeForCausalLM._debug_step}] "
+                    f"norm={_hs.norm().item():.4f} "
+                    f"mean={_hs.mean().item():.6f} "
+                    f"std={_hs.std().item():.6f} "
+                    f"max={_hs.max().item():.4f} "
+                    f"min={_hs.min().item():.4f} "
+                    f"nan={_hs.isnan().sum().item()} "
+                    f"inf={_hs.isinf().sum().item()}\n"
+                )
+
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
