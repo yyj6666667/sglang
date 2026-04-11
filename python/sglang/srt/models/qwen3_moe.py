@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -794,8 +795,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
 
         if not torch.cuda.is_current_stream_capturing():
-            Qwen3MoeForCausalLM._debug_log.write(
-                f"[LAYER {self.layer_id}] attn_out std={hidden_states.float().std():.4f}\n"
+            Qwen3MoeForCausalLM._debug_write(
+                f"[LAYER {self.layer_id}] attn_out std={hidden_states.float().std():.4f}"
             )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -818,8 +819,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         if not torch.cuda.is_current_stream_capturing():
-            Qwen3MoeForCausalLM._debug_log.write(
-                f"[LAYER {self.layer_id}] mlp_out  std={hidden_states.float().std():.4f}\n"
+            Qwen3MoeForCausalLM._debug_write(
+                f"[LAYER {self.layer_id}] mlp_out  std={hidden_states.float().std():.4f}"
             )
 
         if should_allreduce_fusion:
@@ -831,7 +832,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         if not torch.cuda.is_current_stream_capturing():
             hs = (hidden_states + residual).float() if residual is not None else hidden_states.float()
-            Qwen3MoeForCausalLM._debug_log.write(
+            Qwen3MoeForCausalLM._debug_write(
                 f"[LAYER {self.layer_id}] "
                 f"norm={hs.norm().item():.4f} "
                 f"mean={hs.mean().item():.6f} "
@@ -839,12 +840,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 f"max={hs.max().item():.4f} "
                 f"min={hs.min().item():.4f} "
                 f"nan={hs.isnan().sum().item()} "
-                f"inf={hs.isinf().sum().item()}\n"
+                f"inf={hs.isinf().sum().item()}"
             )
             if self.layer_id < 10:
                 hs_slice = hs.detach().cpu().tolist()
-                Qwen3MoeForCausalLM._debug_log.write(
-                    f"[LAYER {self.layer_id}] hidden_state={hs_slice}\n"
+                Qwen3MoeForCausalLM._debug_write(
+                    f"[LAYER {self.layer_id}] hidden_state={hs_slice}"
                 )
 
         return hidden_states, residual
@@ -963,7 +964,29 @@ class Qwen3MoeForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     _debug_step = 0
-    _debug_log = open("./debug.log", "a", buffering=1)
+    _debug_log = None
+
+    @classmethod
+    def _get_debug_log(cls):
+        if cls._debug_log is None:
+            log_dir = os.environ.get("SGLANG_DEBUG_LOG_DIR", "/tmp")
+            os.makedirs(log_dir, exist_ok=True)
+            rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+            pid = os.getpid()
+            log_path = os.path.join(log_dir, f"qwen3_moe_debug_rank{rank}_pid{pid}.log")
+            cls._debug_log = open(log_path, "a", buffering=1)
+            cls._debug_log.write(f"[INIT] debug_log={log_path}\n")
+        return cls._debug_log
+
+    @classmethod
+    def _debug_write(cls, msg: str):
+        # Print to terminal first so user can see hidden states immediately.
+        print(msg, flush=True)
+        try:
+            cls._get_debug_log().write(msg + "\n")
+        except Exception:
+            # Keep inference running even if filesystem is unavailable.
+            pass
 
     @torch.no_grad()
     def forward(
@@ -982,12 +1005,12 @@ class Qwen3MoeForCausalLM(nn.Module):
                 _mode = getattr(forward_batch, "forward_mode", "?")
                 _seqlens = getattr(forward_batch, "seq_lens_cpu", None)
                 _seqlens_str = _seqlens.tolist() if _seqlens is not None else "?"
-                Qwen3MoeForCausalLM._debug_log.write(
+                Qwen3MoeForCausalLM._debug_write(
                     f"[DBG step={Qwen3MoeForCausalLM._debug_step}] "
                     f"mode={_mode} "
                     f"input_ids={_ids} "
                     f"positions={_pos} "
-                    f"seq_lens={_seqlens_str}\n"
+                    f"seq_lens={_seqlens_str}"
                 )
         hidden_states = self.model(
             input_ids,
@@ -1000,7 +1023,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         if not torch.cuda.is_current_stream_capturing():
             if Qwen3MoeForCausalLM._debug_step <= 20:
                 _hs = (hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states).float()
-                Qwen3MoeForCausalLM._debug_log.write(
+                Qwen3MoeForCausalLM._debug_write(
                     f"[DBG step={Qwen3MoeForCausalLM._debug_step}] "
                     f"norm={_hs.norm().item():.4f} "
                     f"mean={_hs.mean().item():.6f} "
@@ -1008,7 +1031,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     f"max={_hs.max().item():.4f} "
                     f"min={_hs.min().item():.4f} "
                     f"nan={_hs.isnan().sum().item()} "
-                    f"inf={_hs.isinf().sum().item()}\n"
+                    f"inf={_hs.isinf().sum().item()}"
                 )
 
         aux_hidden_states = None
