@@ -841,6 +841,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 f"nan={hs.isnan().sum().item()} "
                 f"inf={hs.isinf().sum().item()}\n"
             )
+            if self.layer_id < 10:
+                hs_slice = hs.detach().cpu().tolist()
+                Qwen3MoeForCausalLM._debug_log.write(
+                    f"[LAYER {self.layer_id}] hidden_state={hs_slice}\n"
+                )
 
         return hidden_states, residual
 
