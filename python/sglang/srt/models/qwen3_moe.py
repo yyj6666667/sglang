@@ -982,12 +982,16 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        _is_decode = False
         if not torch.cuda.is_current_stream_capturing():
             Qwen3MoeForCausalLM._debug_step += 1
-            if Qwen3MoeForCausalLM._debug_step <= 20:
+            _mode = getattr(forward_batch, "forward_mode", None)
+            _is_decode = _mode is not None and _mode.is_decode()
+            # Always log decode steps; cap prefill at first 5 steps.
+            _should_log = _is_decode or Qwen3MoeForCausalLM._debug_step <= 5
+            if _should_log:
                 _ids = input_ids[:8].cpu().tolist()
                 _pos = positions[:8].cpu().tolist()
-                _mode = getattr(forward_batch, "forward_mode", "?")
                 _seqlens = getattr(forward_batch, "seq_lens_cpu", None)
                 _seqlens_str = _seqlens.tolist() if _seqlens is not None else "?"
                 Qwen3MoeForCausalLM._debug_write(
@@ -1006,10 +1010,14 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
 
         if not torch.cuda.is_current_stream_capturing():
-            if Qwen3MoeForCausalLM._debug_step <= 20:
+            _mode = getattr(forward_batch, "forward_mode", None)
+            _is_decode = _mode is not None and _mode.is_decode()
+            _should_log = _is_decode or Qwen3MoeForCausalLM._debug_step <= 5
+            if _should_log:
                 _hs = (hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states).float()
                 Qwen3MoeForCausalLM._debug_write(
-                    f"[DBG step={Qwen3MoeForCausalLM._debug_step}] "
+                    f"[DBG step={Qwen3MoeForCausalLM._debug_step}] final_hs "
+                    f"shape={list(_hs.shape)} "
                     f"norm={_hs.norm().item():.4f} "
                     f"mean={_hs.mean().item():.6f} "
                     f"std={_hs.std().item():.6f} "
@@ -1024,9 +1032,26 @@ class Qwen3MoeForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
+            logits_out = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
+            if not torch.cuda.is_current_stream_capturing() and _is_decode:
+                _logits = logits_out.next_token_logits
+                if _logits is not None:
+                    _lf = _logits.float()
+                    _topk = min(5, _lf.shape[-1])
+                    _topvals, _topidx = _lf[0].topk(_topk)
+                    Qwen3MoeForCausalLM._debug_write(
+                        f"[DBG step={Qwen3MoeForCausalLM._debug_step}] logits "
+                        f"shape={list(_lf.shape)} "
+                        f"max={_lf.max().item():.4f} "
+                        f"min={_lf.min().item():.4f} "
+                        f"nan={_lf.isnan().sum().item()} "
+                        f"inf={_lf.isinf().sum().item()} "
+                        f"top{_topk}_ids={_topidx.tolist()} "
+                        f"top{_topk}_vals={[round(v,3) for v in _topvals.tolist()]}"
+                    )
+            return logits_out
         else:
             return hidden_states
 
