@@ -794,11 +794,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if not torch.cuda.is_current_stream_capturing():
-            Qwen3MoeForCausalLM._debug_write(
-                f"[LAYER {self.layer_id}] attn_out std={hidden_states.float().std():.4f}"
-            )
-
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -818,11 +813,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
 
-        if not torch.cuda.is_current_stream_capturing():
-            Qwen3MoeForCausalLM._debug_write(
-                f"[LAYER {self.layer_id}] mlp_out  std={hidden_states.float().std():.4f}"
-            )
-
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -841,10 +831,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 f"min={hs.min().item():.4f} "
                 f"nan={hs.isnan().sum().item()} "
                 f"inf={hs.isinf().sum().item()}"
-            )
-            hs_slice = hs.detach().cpu().tolist()
-            Qwen3MoeForCausalLM._debug_write(
-                f"[LAYER {self.layer_id}] hidden_state={hs_slice}"
             )
 
         return hidden_states, residual
