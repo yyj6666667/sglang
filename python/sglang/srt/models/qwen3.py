@@ -1,5 +1,6 @@
 # Adapted from qwen2.py
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -260,6 +261,7 @@ class Qwen3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
+        self.layer_id = layer_id
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
@@ -281,6 +283,11 @@ class Qwen3DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _is_decode = (
+            not torch.cuda.is_current_stream_capturing()
+            and forward_batch.forward_mode.is_decode()
+        )
+
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -293,6 +300,14 @@ class Qwen3DecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+            )
+
+        if _is_decode:
+            _hs = hidden_states.float()
+            Qwen3ForCausalLM._debug_write(
+                f"[LAYER {self.layer_id}] attn_out "
+                f"std={_hs.std():.4f} mean={_hs.mean():.6f} "
+                f"norm={_hs.norm():.4f} max={_hs.max():.4f} min={_hs.min():.4f}"
             )
 
         # Fully Connected
@@ -314,9 +329,32 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
+
+        if _is_decode:
+            _hs = hidden_states.float()
+            Qwen3ForCausalLM._debug_write(
+                f"[LAYER {self.layer_id}] mlp_out  "
+                f"std={_hs.std():.4f} mean={_hs.mean():.6f} "
+                f"norm={_hs.norm():.4f} max={_hs.max():.4f} min={_hs.min():.4f}"
+            )
+
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+
+        if _is_decode:
+            hs = (hidden_states + residual).float() if residual is not None else hidden_states.float()
+            Qwen3ForCausalLM._debug_write(
+                f"[LAYER {self.layer_id}] post "
+                f"norm={hs.norm():.4f} mean={hs.mean():.6f} "
+                f"std={hs.std():.6f} max={hs.max():.4f} min={hs.min():.4f} "
+                f"nan={hs.isnan().sum().item()} inf={hs.isinf().sum().item()}"
+            )
+            if self.layer_id < 4:
+                Qwen3ForCausalLM._debug_write(
+                    f"[LAYER {self.layer_id}] values={hs.detach().cpu().flatten()[:16].tolist()}"
+                )
+
         return hidden_states, residual
 
 
@@ -338,6 +376,25 @@ class Qwen3Model(Qwen2Model):
 
 
 class Qwen3ForCausalLM(nn.Module):
+    _DEBUG_LOG_PATH = "/home/yyj/debug_origin.log"
+    _debug_step = 0
+    _debug_log = None
+
+    @classmethod
+    def _get_debug_log(cls):
+        if cls._debug_log is None:
+            cls._debug_log = open(cls._DEBUG_LOG_PATH, "a", buffering=1)
+            cls._debug_log.write(f"[INIT] sglang debug_log={cls._DEBUG_LOG_PATH}\n")
+        return cls._debug_log
+
+    @classmethod
+    def _debug_write(cls, msg: str):
+        print(msg, flush=True)
+        try:
+            cls._get_debug_log().write(msg + "\n")
+        except Exception:
+            pass
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -406,6 +463,23 @@ class Qwen3ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        _is_decode = (
+            not torch.cuda.is_current_stream_capturing()
+            and forward_batch.forward_mode.is_decode()
+        )
+
+        if _is_decode:
+            Qwen3ForCausalLM._debug_step += 1
+            _ids = input_ids[:8].cpu().tolist()
+            _pos = positions[:8].cpu().tolist()
+            _mode = forward_batch.forward_mode
+            _seqlens = getattr(forward_batch, "seq_lens_cpu", None)
+            _seqlens_str = _seqlens.tolist() if _seqlens is not None else "?"
+            Qwen3ForCausalLM._debug_write(
+                f"\n[DECODE step={Qwen3ForCausalLM._debug_step}] "
+                f"mode={_mode} input_ids={_ids} positions={_pos} seq_lens={_seqlens_str}"
+            )
+
         hidden_states = self.model(
             input_ids,
             positions,
@@ -417,6 +491,15 @@ class Qwen3ForCausalLM(nn.Module):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+
+        if _is_decode:
+            _hs = (hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states).float()
+            Qwen3ForCausalLM._debug_write(
+                f"[DECODE step={Qwen3ForCausalLM._debug_step}] final_hidden "
+                f"norm={_hs.norm():.4f} mean={_hs.mean():.6f} "
+                f"std={_hs.std():.6f} max={_hs.max():.4f} min={_hs.min():.4f} "
+                f"nan={_hs.isnan().sum().item()} inf={_hs.isinf().sum().item()}"
+            )
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
