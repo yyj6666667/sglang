@@ -830,7 +830,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-        if not torch.cuda.is_current_stream_capturing():
+        if not torch.cuda.is_current_stream_capturing() and forward_batch.forward_mode.is_decode():
             hs = (hidden_states + residual).float() if residual is not None else hidden_states.float()
             Qwen3MoeForCausalLM._debug_write(
                 f"[LAYER {self.layer_id}] "
@@ -842,11 +842,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 f"nan={hs.isnan().sum().item()} "
                 f"inf={hs.isinf().sum().item()}"
             )
-            if self.layer_id < 10:
-                hs_slice = hs.detach().cpu().tolist()
-                Qwen3MoeForCausalLM._debug_write(
-                    f"[LAYER {self.layer_id}] hidden_state={hs_slice}"
-                )
+            hs_slice = hs.detach().cpu().tolist()
+            Qwen3MoeForCausalLM._debug_write(
+                f"[LAYER {self.layer_id}] hidden_state={hs_slice}"
+            )
 
         return hidden_states, residual
 
@@ -969,11 +968,11 @@ class Qwen3MoeForCausalLM(nn.Module):
     @classmethod
     def _get_debug_log(cls):
         if cls._debug_log is None:
-            log_dir = os.environ.get("SGLANG_DEBUG_LOG_DIR", "/tmp")
+            log_dir = os.environ.get("SGLANG_DEBUG_LOG_DIR", "/home/yyj")
             os.makedirs(log_dir, exist_ok=True)
             rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
             pid = os.getpid()
-            log_path = os.path.join(log_dir, f"qwen3_moe_debug_rank{rank}_pid{pid}.log")
+            log_path = os.path.join(log_dir, f"kt-debug_rank{rank}_pid{pid}.log")
             cls._debug_log = open(log_path, "a", buffering=1)
             cls._debug_log.write(f"[INIT] debug_log={log_path}\n")
         return cls._debug_log
