@@ -697,6 +697,7 @@ class Qwen3MoeAttention(nn.Module):
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
             )
+            _dump("attn_k_pre_rope", self.attn.layer_id, k)
             q, k = self.rotary_emb(
                 positions,
                 q,
