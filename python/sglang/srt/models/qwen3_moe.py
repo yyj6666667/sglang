@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os as _os_dump
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -96,6 +97,68 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+
+# === debug dump instrumentation (env: SGLANG_DUMP_LOG) ===
+_DUMP_PATH = _os_dump.environ.get("SGLANG_DUMP_LOG")
+_DUMP_MAX_STEPS = int(_os_dump.environ.get("SGLANG_DUMP_MAX_STEPS", "2"))
+_DUMP_STEP = 0
+_DUMP_FILE = None
+
+
+def _dump_bump_step():
+    global _DUMP_STEP
+    _DUMP_STEP += 1
+    if _DUMP_FILE is not None and _DUMP_STEP <= _DUMP_MAX_STEPS:
+        _DUMP_FILE.write(f"===== STEP {_DUMP_STEP} =====\n")
+
+
+def _dump(tag, layer_id, tensor):
+    global _DUMP_FILE
+    if _DUMP_PATH is None:
+        return
+    if _DUMP_STEP == 0 or _DUMP_STEP > _DUMP_MAX_STEPS:
+        return
+    if tensor is None:
+        return
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        pass
+    try:
+        if get_tensor_model_parallel_rank() != 0:
+            return
+    except Exception:
+        pass
+    t = tensor.detach()
+    if _DUMP_FILE is None:
+        _DUMP_FILE = open(_DUMP_PATH, "a", buffering=1)
+        _DUMP_FILE.write(f"===== STEP {_DUMP_STEP} =====\n")
+    lid = -1 if layer_id is None else int(layer_id)
+    if t.dtype in (torch.int32, torch.int64, torch.bool):
+        flat = t.flatten().cpu()
+        n = flat.numel()
+        preview = flat[: min(64, n)].tolist()
+        _DUMP_FILE.write(
+            f"[STEP {_DUMP_STEP}] [L{lid:02d}] [{tag:<18}] "
+            f"shape={list(t.shape)} dtype={t.dtype} values={preview}\n"
+        )
+    else:
+        tf = t.float()
+        flat = tf.flatten()
+        n = flat.numel()
+        first8 = flat[: min(8, n)].cpu().tolist()
+        last8 = flat[max(0, n - 8) :].cpu().tolist()
+        fmt = lambda xs: "[" + ",".join(f"{x:+.4e}" for x in xs) + "]"
+        _DUMP_FILE.write(
+            f"[STEP {_DUMP_STEP}] [L{lid:02d}] [{tag:<18}] "
+            f"shape={list(t.shape)} dtype={t.dtype} "
+            f"norm={tf.norm().item():.6e} mean={tf.mean().item():+.6e} "
+            f"std={tf.std().item():.6e} min={tf.min().item():+.6e} max={tf.max().item():+.6e} "
+            f"nan={int(tf.isnan().sum().item())} inf={int(tf.isinf().sum().item())} "
+            f"first8={fmt(first8)} last8={fmt(last8)}\n"
+        )
 
 
 def compute_yarn_parameters(
@@ -301,8 +364,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        _dump("router_logits", self.layer_id, router_logits)
         topk_output = self.topk(hidden_states, router_logits)
+        _dump("topk_ids", self.layer_id, topk_output.topk_ids)
+        _dump("topk_weights", self.layer_id, topk_output.topk_weights)
         final_hidden_states = self.experts(hidden_states, topk_output)
+        _dump("moe_out_before_ar", self.layer_id, final_hidden_states)
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -310,6 +377,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        _dump("moe_out_ar", self.layer_id, final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -556,6 +624,10 @@ class Qwen3MoeAttention(nn.Module):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
+    def _dump_qk(self, q, k):
+        _dump("attn_q", self.attn.layer_id, q)
+        _dump("attn_k", self.attn.layer_id, k)
+
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
         use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
         if use_fused:
@@ -610,6 +682,7 @@ class Qwen3MoeAttention(nn.Module):
                 ),
             )
             self._used_fused_qk_norm_rope_last_call = False
+        self._dump_qk(q, k)
         return q, k, v
 
     def forward_prepare(
@@ -652,6 +725,7 @@ class Qwen3MoeAttention(nn.Module):
             fb,
             save_kv_cache=save_kv_cache,
         )
+        _dump("attn_out", self.attn.layer_id, attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -775,6 +849,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 **kwargs,
             )
         )
+        _dump("hidden_in", self.layer_id, hidden_states)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -782,6 +857,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        _dump("post_attn", self.layer_id, hidden_states)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -808,6 +884,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+
+        _dump("layer_out", self.layer_id, hidden_states)
+        if residual is not None:
+            _dump("layer_out_resid", self.layer_id, residual)
 
         return hidden_states, residual
 
@@ -933,6 +1013,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        _dump_bump_step()
+        _dump("input_ids", None, input_ids)
+        _dump("positions", None, positions)
         hidden_states = self.model(
             input_ids,
             positions,
@@ -940,6 +1023,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        _dump("final_hidden", None, hidden_states)
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
