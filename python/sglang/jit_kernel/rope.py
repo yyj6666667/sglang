@@ -78,7 +78,7 @@ def apply_rope_inplace(
     module.run_rope(q, k, cos_sin_cache, positions)
 
 
-@register_custom_op(mutates_args=["q", "k_cache", "v_cache"])
+@register_custom_op(mutates_args=["q", "k", "k_cache", "v_cache"])
 def apply_rope_inplace_with_kvcache(
     q: torch.Tensor,
     k: torch.Tensor,
