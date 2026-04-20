@@ -934,6 +934,10 @@ class Envs:
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
+    # Plugin system
+    SGLANG_PLATFORM = EnvStr("")
+    SGLANG_PLUGINS = EnvStr("")
+
 
 envs = Envs()
 EnvField._allow_set_name = False
