@@ -1,9 +1,16 @@
-import fcntl
 import logging
+import sys
 import threading
 import time
 from multiprocessing import shared_memory
 from typing import Tuple
+
+if sys.platform != "win32":
+    import fcntl
+else:
+    # Windows doesn't ship fcntl; CUDA IPC multi-process transport isn't a
+    # startup-critical path. Calls that reach fcntl.* will raise at runtime.
+    fcntl = None
 
 import numpy as np
 import torch
@@ -329,10 +336,12 @@ class CudaIpcTensorTransportProxy:
                     open(SHM_LOCK_FILE, "a").close()
                     # write the shm_sync_buffer with a file lock
                     with open(SHM_LOCK_FILE, "w+") as f:
-                        fcntl.flock(f, fcntl.LOCK_EX)
+                        if fcntl is not None:
+                            fcntl.flock(f, fcntl.LOCK_EX)
                         sync_flag = self.get_sync_flag
                         sync_flag += 1
-                        fcntl.flock(f, fcntl.LOCK_UN)
+                        if fcntl is not None:
+                            fcntl.flock(f, fcntl.LOCK_UN)
 
                     self.close_shm()
 

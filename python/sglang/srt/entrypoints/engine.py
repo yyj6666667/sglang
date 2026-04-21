@@ -33,7 +33,11 @@ from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tupl
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import torch
-import uvloop
+
+try:
+    import uvloop  # Linux/macOS only; Windows has no wheel.
+except ImportError:
+    uvloop = None
 import zmq
 
 from sglang.srt.entrypoints.EngineBase import EngineBase
@@ -89,7 +93,8 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+if uvloop is not None:
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
 

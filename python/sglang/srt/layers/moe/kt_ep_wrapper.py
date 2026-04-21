@@ -449,11 +449,18 @@ class SharedFullContext:
         Uses double buffering (2 experts) to reduce memory usage while maintaining
         pipeline efficiency: write(e+1) || copy(e) only needs 2 buffers.
         """
-        # Set NUMA local allocation policy to allocate on local NUMA node
-        libnuma = ctypes.CDLL("libnuma.so.1")
-        if libnuma.numa_available() < 0:
-            raise RuntimeError("NUMA is not available on this system")
-        libnuma.numa_set_localalloc()
+        # Set NUMA local allocation policy to allocate on local NUMA node.
+        # libnuma is Linux-only; on Windows we skip the policy call (MoE EP
+        # isn't the fi-win single-GPU happy path anyway).
+        try:
+            libnuma = ctypes.CDLL("libnuma.so.1")
+            if libnuma.numa_available() < 0:
+                raise RuntimeError("NUMA is not available on this system")
+            libnuma.numa_set_localalloc()
+        except OSError:
+            # libnuma.so.1 not available (e.g. Windows). Continue without
+            # NUMA-local allocation; buffers will fall on the default node.
+            pass
 
         self.cpu_buffers = {}
         self.shm_handles: Dict[str, shared_memory.SharedMemory] = {}

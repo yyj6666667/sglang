@@ -45,7 +45,11 @@ import numpy as np
 import orjson
 import requests
 import uvicorn
-import uvloop
+
+try:
+    import uvloop  # Linux/macOS only; Windows falls back to asyncio default.
+except ImportError:
+    uvloop = None
 from fastapi import (
     Depends,
     FastAPI,
@@ -176,7 +180,8 @@ from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+if uvloop is not None:
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 # Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -2027,6 +2032,7 @@ def launch_server(
         set_uvicorn_logging_configs(server_args)
 
         # Listen for HTTP requests
+        _uvicorn_loop = "uvloop" if uvloop is not None else "asyncio"
         if server_args.tokenizer_worker_num == 1:
             # Default case, one tokenizer process
             uvicorn.run(
@@ -2036,7 +2042,7 @@ def launch_server(
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=5,
-                loop="uvloop",
+                loop=_uvicorn_loop,
             )
         else:
             # Multiple tokenizer and http processes
@@ -2056,7 +2062,7 @@ def launch_server(
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=5,
-                loop="uvloop",
+                loop=_uvicorn_loop,
                 workers=server_args.tokenizer_worker_num,
             )
     finally:

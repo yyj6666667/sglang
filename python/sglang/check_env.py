@@ -2,7 +2,11 @@
 
 import importlib.metadata
 import os
-import resource
+
+try:
+    import resource  # POSIX-only.
+except ImportError:
+    resource = None
 import subprocess
 import sys
 from abc import abstractmethod
@@ -122,6 +126,8 @@ class BaseEnv:
             return {}
 
     def get_ulimit_soft(self) -> dict:
+        if resource is None:
+            return {"ulimit soft": "n/a (non-POSIX)"}
         ulimit_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
         return {"ulimit soft": ulimit_soft}
 

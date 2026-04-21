@@ -32,7 +32,11 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-import uvloop
+
+try:
+    import uvloop  # Linux/macOS only.
+except ImportError:
+    uvloop = None
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
@@ -117,7 +121,8 @@ from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+if uvloop is not None:
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
