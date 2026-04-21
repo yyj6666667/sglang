@@ -18,7 +18,13 @@ find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COM
 
 # CXX
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+if(MSVC)
+    # MSVC uses /O2 via CMAKE_BUILD_TYPE=Release; don't append -O3 (unknown flag).
+    # NOMINMAX + _USE_MATH_DEFINES mirror flashinfer's Windows host-compile flags.
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHsc /bigobj /utf-8 /D_USE_MATH_DEFINES /DNOMINMAX /permissive-")
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+endif()
 
 # CUDA
 enable_language(CUDA)
@@ -130,12 +136,10 @@ include_directories(
     ${PROJECT_SOURCE_DIR}/csrc
 )
 
+# Cross-platform core CUDA flags (defines, standards, base archs).
 set(SGL_KERNEL_CUDA_FLAGS
     "-DNDEBUG"
     "-DOPERATOR_NAMESPACE=sgl-kernel"
-    "-O3"
-    "-Xcompiler"
-    "-fPIC"
     "-gencode=arch=compute_90,code=sm_90"
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
@@ -147,26 +151,70 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
+    "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
+    "-Xcudafe=--diag_suppress=2361"  # invalid narrowing conversion from "char" to "signed char"
 
     # The following flag leads to the CMAKE_BUILD_PARALLEL_LEVEL breaking,
     # it triggers OOM with low memory host. Extract the threads number to
     # option named SGL_KERNEL_COMPILE_THREADS, default value 32.
     # "--threads=32"
 
-    # Supress warnings
-    "-Xcompiler=-Wno-clang-format-violations"
-    "-Xcompiler=-Wno-conversion"
-    "-Xcompiler=-Wno-deprecated-declarations"
-    "-Xcompiler=-Wno-terminate"
-    "-Xcompiler=-Wfatal-errors"
-    "-Xcompiler=-ftemplate-backtrace-limit=1"
-    "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
-    "-Xcudafe=--diag_suppress=2361"  # invalid narrowing conversion from "char" to "signed char"
-
     # uncomment to debug
     # "--ptxas-options=-v"
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
+
+if(WIN32)
+    # Resolve the neighbouring flashinfer source tree used for shadow
+    # headers / alternative sources on Windows (override via env FLASHINFER_DIR).
+    if(DEFINED ENV{FLASHINFER_DIR})
+        set(_FI_DIR "$ENV{FLASHINFER_DIR}")
+    else()
+        set(_FI_DIR "C:/flashinfer")
+    endif()
+endif()
+
+if(MSVC)
+    # MSVC / Windows host compiler path. Mirrors flashinfer's cpp_ext.py flag
+    # set (see C:/flashinfer/flashinfer/jit/cpp_ext.py). No -O3, no -fPIC
+    # (implicit on Windows DLLs), no GCC-only -Wno-* warnings.
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-O2"
+        "-Xcompiler=/EHsc"
+        "-Xcompiler=/MD"
+        "-Xcompiler=/bigobj"
+        "-Xcompiler=/utf-8"
+        "-Xcompiler=/permissive-"
+        "-D_USE_MATH_DEFINES"
+        "-DNOMINMAX"
+        "-allow-unsupported-compiler"
+        "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+    )
+    # Force-include msvc_shim.h from the sibling flashinfer tree if present;
+    # it neutralises __restrict__ and other GCC-only tokens inside vendored
+    # CUDA/cutlass headers that sgl-kernel pulls in.
+    set(_MSVC_SHIM "${_FI_DIR}/scripts/windows/msvc_shim.h")
+    if(EXISTS "${_MSVC_SHIM}")
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-Xcompiler=/FI${_MSVC_SHIM}"
+        )
+        message(STATUS "sgl-kernel MSVC: force-include ${_MSVC_SHIM}")
+    endif()
+else()
+    # GCC / Clang host compiler path (original).
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-O3"
+        "-Xcompiler"
+        "-fPIC"
+        # Suppress warnings
+        "-Xcompiler=-Wno-clang-format-violations"
+        "-Xcompiler=-Wno-conversion"
+        "-Xcompiler=-Wno-deprecated-declarations"
+        "-Xcompiler=-Wno-terminate"
+        "-Xcompiler=-Wfatal-errors"
+        "-Xcompiler=-ftemplate-backtrace-limit=1"
+    )
+endif()
 
 set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "Set compilation threads, default 32")
 
@@ -188,6 +236,17 @@ option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
+# mscclpp pulls in POSIX IPC + ibverbs; not portable to MSVC/Windows without
+# major upstream work. Default OFF on Windows (single-GPU / custom_ar path
+# remain available); ON on Linux (original behaviour).
+if(WIN32)
+    set(_DEFAULT_ENABLE_MSCCLPP OFF)
+else()
+    set(_DEFAULT_ENABLE_MSCCLPP ON)
+endif()
+option(SGL_KERNEL_ENABLE_MSCCLPP          "Enable mscclpp"          ${_DEFAULT_ENABLE_MSCCLPP})
+option(SGL_KERNEL_ENABLE_DEEPGEMM         "Enable DeepGEMM (needs nvrtc)" ${_DEFAULT_ENABLE_MSCCLPP})
+option(SGL_KERNEL_ENABLE_FA4_CUTE_DSL     "Install FA4 Cute-DSL tree" ${_DEFAULT_ENABLE_MSCCLPP})
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -243,7 +302,12 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
-    set(SGL_KERNEL_ENABLE_FA3 ON)
+    # FA3 (Hopper) is Linux-focused and its CMake uses file(GLOB) against
+    # sgl-attn Unix paths; leave OFF on Windows (RTX 5060 / SM120 doesn't
+    # need it anyway).
+    if(NOT WIN32)
+        set(SGL_KERNEL_ENABLE_FA3 ON)
+    endif()
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
@@ -259,7 +323,6 @@ endif()
 # NOTE: Please sort the filenames alphabetically
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
-    "csrc/allreduce/mscclpp_allreduce.cu"
     "csrc/attention/cascade.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
@@ -327,6 +390,9 @@ set(SOURCES
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
 
+    # flashinfer sources — on Windows we override the include and source path
+    # below (after this SOURCES block) to our local C:\flashinfer 0.6.7 tree,
+    # which already has the MSVC-friendly __forceinline__ attributes.
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
 
@@ -337,16 +403,44 @@ set(SOURCES
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
+# mscclpp allreduce depends on Microsoft mscclpp. Only compile it when the
+# mscclpp static lib is being built (i.e. SGL_KERNEL_ENABLE_MSCCLPP ON).
+if(SGL_KERNEL_ENABLE_MSCCLPP)
+    list(APPEND SOURCES "csrc/allreduce/mscclpp_allreduce.cu")
+endif()
+
+# (No SOURCES swap on Windows: the pinned flashinfer's norm.cu / renorm.cu
+# compile fine once vec_dtypes.cuh is shadow-patched. See CMake INCLUDES
+# block + windows_shadow_patches.cmake.)
+
+# flashinfer headers — use the FetchContent pinned tree (bc29697b) which
+# includes `pytorch_extension_utils.h` that newer local flashinfer removed.
+# On Windows we apply a targeted shadow-patch to `vec_dtypes.cuh` below
+# (see WIN32 block) to replace GCC-only __attribute__((always_inline))
+# __device__ with __forceinline__ __device__ so MSVC parses it.
 set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
-    ${repo-mscclpp_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+if(SGL_KERNEL_ENABLE_MSCCLPP)
+    list(APPEND INCLUDES ${repo-mscclpp_SOURCE_DIR}/include)
+endif()
+
+if(WIN32)
+    # Shadow-include directory that overlays a patched vec_dtypes.cuh (and
+    # any other future per-header MSVC fixes) BEFORE the FetchContent
+    # flashinfer headers. The patched file is emitted at configure time
+    # by windows_shadow_patches.cmake.
+    set(_WIN_SHADOW_DIR "${CMAKE_CURRENT_BINARY_DIR}/windows_shadow")
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/windows_shadow_patches.cmake)
+    # Prepend the shadow dir so patched files win header lookup.
+    list(INSERT INCLUDES 0 "${_WIN_SHADOW_DIR}")
+endif()
 
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
@@ -376,33 +470,49 @@ set_target_properties(common_ops_sm100_build PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
 )
 
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
-execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
-    OUTPUT_VARIABLE TORCH_CXX11_ABI
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-if(TORCH_CXX11_ABI STREQUAL "0")
-    message(STATUS "Using old C++ ABI (-D_GLIBCXX_USE_CXX11_ABI=0)")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
-else()
-    message(STATUS "Using new C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI=1)")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
+# libstdc++ ABI detection is meaningful only for gcc/libstdc++; MSVC uses its
+# own STL and has no _GLIBCXX_USE_CXX11_ABI concept. Skip on Windows.
+if(NOT MSVC)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
+        OUTPUT_VARIABLE TORCH_CXX11_ABI
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(TORCH_CXX11_ABI STREQUAL "0")
+        message(STATUS "Using old C++ ABI (-D_GLIBCXX_USE_CXX11_ABI=0)")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
+    else()
+        message(STATUS "Using new C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI=1)")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
+    endif()
 endif()
 
 # mscclpp option
-set(MSCCLPP_USE_CUDA ON)
-set(MSCCLPP_BYPASS_GPU_CHECK ON)
-set(MSCCLPP_BUILD_TESTS OFF)
-add_subdirectory(
-    ${repo-mscclpp_SOURCE_DIR}
-    ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
-)
+if(SGL_KERNEL_ENABLE_MSCCLPP)
+    set(MSCCLPP_USE_CUDA ON)
+    set(MSCCLPP_BYPASS_GPU_CHECK ON)
+    set(MSCCLPP_BUILD_TESTS OFF)
+    add_subdirectory(
+        ${repo-mscclpp_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
+    )
+    target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+    target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+else()
+    # mscclpp disabled: common_ops still links torch + CUDA libs, but no
+    # mscclpp symbols. The dispatcher in csrc/common_extension.cc guards
+    # mscclpp_* registrations with #ifdef SGL_KERNEL_HAS_MSCCLPP.
+    target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+    target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+endif()
 
-target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
-target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+if(SGL_KERNEL_ENABLE_MSCCLPP)
+    target_compile_definitions(common_ops_sm90_build PRIVATE SGL_KERNEL_HAS_MSCCLPP)
+    target_compile_definitions(common_ops_sm100_build PRIVATE SGL_KERNEL_HAS_MSCCLPP)
+endif()
 
 # sparse flash attention
 target_compile_definitions(common_ops_sm90_build PRIVATE
@@ -525,52 +635,59 @@ target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Extra Install: FLashMLA ============================= #
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+if(NOT WIN32)
+    # FlashMLA uses source-file patching and Unix globs; defer Windows port
+    # until the base common_ops build is green.
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+endif()
 
 # ============================ Extra Install: DeepGEMM (JIT) ============================= #
 # Create a separate library for DeepGEMM's Python API.
 # This keeps its compilation isolated from the main common_ops.
-set(DEEPGEMM_SOURCES
-    "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
-)
+# DeepGEMM links against mscclpp_static, so it's gated alongside mscclpp.
+if(SGL_KERNEL_ENABLE_DEEPGEMM)
+    set(DEEPGEMM_SOURCES
+        "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
+    )
 
-Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
+    Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
 
-# Link against necessary libraries, including nvrtc for JIT compilation.
-target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
+    # Link against necessary libraries, including nvrtc for JIT compilation.
+    target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
 
-# Add include directories needed by DeepGEMM.
-target_include_directories(deep_gemm_cpp PRIVATE
-    ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
-    ${repo-cutlass_SOURCE_DIR}/include
-    ${repo-fmt_SOURCE_DIR}/include
-)
+    # Add include directories needed by DeepGEMM.
+    target_include_directories(deep_gemm_cpp PRIVATE
+        ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
+        ${repo-cutlass_SOURCE_DIR}/include
+        ${repo-fmt_SOURCE_DIR}/include
+    )
 
-# Apply the same compile options as common_ops.
-target_compile_options(deep_gemm_cpp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+    # Apply the same compile options as common_ops.
+    target_compile_options(deep_gemm_cpp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 
-# Create an empty __init__.py to make `deepgemm` a Python package.
-file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py "")
-install(
-    FILES ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py
-    DESTINATION deep_gemm
-    RENAME __init__.py
-)
+    # Create an empty __init__.py to make `deepgemm` a Python package.
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py "")
+    install(
+        FILES ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py
+        DESTINATION deep_gemm
+        RENAME __init__.py
+    )
 
-# Install the compiled DeepGEMM API library.
-install(TARGETS deep_gemm_cpp LIBRARY DESTINATION deep_gemm)
+    # Install the compiled DeepGEMM API library.
+    install(TARGETS deep_gemm_cpp LIBRARY DESTINATION deep_gemm)
 
-# Install the source files required by DeepGEMM for runtime JIT compilation.
-install(
-    DIRECTORY ${repo-deepgemm_SOURCE_DIR}/deep_gemm/
-    DESTINATION deep_gemm
-)
+    # Install the source files required by DeepGEMM for runtime JIT compilation.
+    install(
+        DIRECTORY ${repo-deepgemm_SOURCE_DIR}/deep_gemm/
+        DESTINATION deep_gemm
+    )
 
-install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
-        DESTINATION "deep_gemm/include/cute")
+    install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
+            DESTINATION "deep_gemm/include/cute")
 
-install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
-        DESTINATION "deep_gemm/include/cutlass")
+    install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
+            DESTINATION "deep_gemm/include/cutlass")
+endif()
 
 # ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
@@ -580,7 +697,9 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
 
 # ============================ Extra Install: FA4 ============================= #
 # TODO: find a better install condition.
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+# FA4 Cute-DSL install requires nvidia-cutlass-dsl + quack-kernels at runtime;
+# neither ship Windows wheels, so we skip the patching+install on Windows.
+if (("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A) AND SGL_KERNEL_ENABLE_FA4_CUTE_DSL)
 
     set(FLASH_ATTN_CUTE_SRC "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute")
     set(FLASH_ATTN_CUTE_DST "${CMAKE_CURRENT_BINARY_DIR}/flash_attn_origin/cute")

@@ -38,6 +38,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
+#ifdef SGL_KERNEL_HAS_MSCCLPP
+  // mscclpp-based multi-GPU allreduce. On Windows (no mscclpp port) these
+  // symbols are unavailable; single-GPU code paths use custom_ar above.
   m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
   m.def(
       "mscclpp_init_context(Tensor unique_id, int rank, int world_size, Tensor scratch, Tensor put_buffer, "
@@ -46,6 +49,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("mscclpp_allreduce(int context, Tensor inp, Tensor! out, int nthreads, int nblocks) -> ()");
   m.impl("mscclpp_allreduce", torch::kCUDA, &mscclpp_allreduce);
+#endif
 
   /*
    * From csrc/attention

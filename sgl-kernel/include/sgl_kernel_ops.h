@@ -85,7 +85,9 @@ void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
 
-// mscclpp
+// mscclpp — only declared when the mscclpp backend is actually compiled
+// (disabled on Windows; see sgl-kernel/CMakeLists.txt SGL_KERNEL_ENABLE_MSCCLPP).
+#ifdef SGL_KERNEL_HAS_MSCCLPP
 torch::Tensor mscclpp_generate_unique_id();
 fptr_t mscclpp_init_context(
     const torch::Tensor& unique_id,
@@ -98,6 +100,7 @@ fptr_t mscclpp_init_context(
     const std::vector<int64_t>& rank_to_ib,
     const int64_t context_selection);
 void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, int64_t nthreads, int64_t nblocks);
+#endif
 #endif
 
 /*
