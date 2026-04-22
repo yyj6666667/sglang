@@ -4,6 +4,12 @@ import asyncio
 import os
 import sys
 
+# Windows asyncio: the default ProactorEventLoop lacks add_reader, which
+# pyzmq's asyncio socket driver needs. Switch to SelectorEventLoop so zmq's
+# asyncio integration works without installing tornado.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import suppress_noisy_warnings

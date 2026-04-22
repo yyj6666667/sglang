@@ -1436,14 +1436,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.event_loop = loop
 
         # We only add signal handler when the tokenizer manager is in the main thread
-        # due to the CPython limitation.
+        # due to the CPython limitation. Windows asyncio loops don't implement
+        # add_signal_handler; skip there and rely on default Ctrl-C / SIGTERM
+        # termination.
         if threading.current_thread() is threading.main_thread():
             signal_handler = self.signal_handler_class(self)
-            loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
-            # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
-            loop.add_signal_handler(
-                signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
-            )
+            try:
+                loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
+                # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
+                loop.add_signal_handler(
+                    signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
+                )
+            except NotImplementedError:
+                logger.warning(
+                    "Event loop does not support add_signal_handler "
+                    "(Windows); skipping SIGTERM/SIGQUIT hooks."
+                )
 
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))

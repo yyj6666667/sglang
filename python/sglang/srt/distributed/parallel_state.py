@@ -1629,6 +1629,18 @@ def init_distributed_environment(
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
 
+        # Windows PyTorch builds don't include NCCL; fall back to gloo so
+        # single-process TP=1 still boots. Multi-GPU collectives won't work
+        # under gloo for CUDA tensors, but this covers the single-GPU path
+        # we target on fi-win.
+        import sys as _sys
+        if backend == "nccl" and _sys.platform == "win32":
+            logger.warning(
+                "NCCL unavailable on Windows; switching torch.distributed "
+                "backend to gloo. Multi-GPU collectives unsupported."
+            )
+            backend = "gloo"
+
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,

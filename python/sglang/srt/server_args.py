@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import random
+import sys
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
@@ -5779,22 +5780,27 @@ class PortArgs:
         else:
             nccl_port = server_args.nccl_port
 
+        # Windows has no ZMQ ipc:// backend; fall back to tcp:// on loopback.
+        # Linux keeps the cheaper ipc:// transport.
+        def _zmq_ep():
+            if sys.platform == "win32":
+                return f"tcp://127.0.0.1:{get_free_port()}"
+            return f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+
         if server_args.tokenizer_worker_num == 1:
             tokenizer_worker_ipc_name = None
         else:
-            tokenizer_worker_ipc_name = (
-                f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-            )
+            tokenizer_worker_ipc_name = _zmq_ep()
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
-                tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                tokenizer_ipc_name=_zmq_ep(),
+                scheduler_input_ipc_name=_zmq_ep(),
+                detokenizer_ipc_name=_zmq_ep(),
                 nccl_port=nccl_port,
-                rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                rpc_ipc_name=_zmq_ep(),
+                metrics_ipc_name=_zmq_ep(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
         else:

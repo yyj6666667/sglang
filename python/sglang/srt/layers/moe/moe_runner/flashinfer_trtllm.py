@@ -35,7 +35,16 @@ if TYPE_CHECKING:
     )
 
 if is_flashinfer_available() and is_sm120_supported():
-    from flashinfer import fp4_quantize
+    try:
+        from flashinfer import fp4_quantize
+    except ImportError:
+        # Some flashinfer installs (notably Windows editable + CWD-as-sys-path
+        # trap) expose flashinfer as a namespace package with no top-level
+        # symbols. Fall back to sgl_kernel where available.
+        try:
+            from sgl_kernel import scaled_fp4_quant as fp4_quantize
+        except ImportError:
+            fp4_quantize = None
 elif is_cuda_alike():
     from sgl_kernel import scaled_fp4_quant as fp4_quantize
 else:

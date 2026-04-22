@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -236,10 +237,15 @@ async def init_multi_tokenizer() -> ServerArgs:
         server_args.api_key is None
     ), "API key is not supported in multi-tokenizer mode"
 
-    # Create a new ipc name for the current process
-    port_args.tokenizer_ipc_name = (
-        f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-    )
+    # Create a new ipc name for the current process (Windows ZMQ has no ipc://
+    # backend; fall back to tcp:// on loopback).
+    if sys.platform == "win32":
+        from sglang.srt.utils.common import get_free_port as _get_free_port
+        port_args.tokenizer_ipc_name = f"tcp://127.0.0.1:{_get_free_port()}"
+    else:
+        port_args.tokenizer_ipc_name = (
+            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        )
     logger.info(
         f"Start multi-tokenizer worker process {os.getpid()}, "
         f"ipc_name={port_args.tokenizer_ipc_name}"

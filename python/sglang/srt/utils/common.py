@@ -40,6 +40,22 @@ except ImportError:
     resource = None
 import shutil
 import signal
+import sys
+
+# Windows: no SIGQUIT/SIGHUP — alias to SIGTERM so existing callers (send_signal
+# to child, signal.signal(...)) work without ifdef-ing every use site.
+if not hasattr(signal, "SIGQUIT"):
+    signal.SIGQUIT = signal.SIGTERM  # type: ignore[attr-defined]
+if not hasattr(signal, "SIGHUP"):
+    signal.SIGHUP = signal.SIGTERM  # type: ignore[attr-defined]
+
+# Windows asyncio: switch every process (parent + mp-spawned workers) to
+# WindowsSelectorEventLoopPolicy so pyzmq's asyncio socket driver (needs
+# add_reader) works without tornado. This module is imported via sglang
+# root, so setting the policy here covers all spawned subprocesses too.
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import socket
 import subprocess
 import sys
