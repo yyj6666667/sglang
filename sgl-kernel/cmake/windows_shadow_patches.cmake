@@ -23,7 +23,7 @@
 
 function(_sgl_inplace_patch file_path marker label)
     if(NOT EXISTS "${file_path}")
-        message(WARNING "sgl-kernel Windows patch: target not found: ${file_path}")
+        # Non-fatal: FA/DeepGEMM may not be populated on every build; skip.
         return()
     endif()
     file(READ "${file_path}" _content)
@@ -67,6 +67,21 @@ function(_sgl_inplace_patch file_path marker label)
             ""
             _content "${_content}")
         set(_content "// ${marker}\n${_content}")
+    elseif(label STREQUAL "alt_tokens")
+        # Rewrite C++ alternative operator tokens (`and`, `or`, `not`) to
+        # their punctuation spellings. nvcc's EDG front-end on MSVC does
+        # NOT recognise the alternative tokens as keywords even with
+        # /permissive-; patching the source is simpler than forcing an
+        # include of <ciso646> (which causes corecrt redefinitions).
+        #
+        # Match only when surrounded by a `)` / `(` token so that
+        # comments using "and" as English are unaffected. Applied to a
+        # specific list of upstream headers; each file uses these tokens
+        # sparingly and the patterns are unambiguous in code.
+        string(REGEX REPLACE "\\) and \\(" ") && (" _content "${_content}")
+        string(REGEX REPLACE "\\) or \\(" ") || (" _content "${_content}")
+        string(REGEX REPLACE "! and " "! && " _content "${_content}")
+        set(_content "// ${marker}\n${_content}")
     else()
         message(FATAL_ERROR "sgl-kernel Windows patch: unknown label '${label}'")
     endif()
@@ -97,3 +112,46 @@ _sgl_inplace_patch(
     "SGL_KERNEL_WIN_PATCH_PYEXT"
     pytorch_ext_utils
 )
+
+_sgl_inplace_patch(
+    "${repo-flashinfer_SOURCE_DIR}/include/flashinfer/pos_enc.cuh"
+    "SGL_KERNEL_WIN_PATCH_POS_ENC"
+    alt_tokens
+)
+
+_sgl_inplace_patch(
+    "${repo-flashinfer_SOURCE_DIR}/include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/KernelParams.h"
+    "SGL_KERNEL_WIN_PATCH_KPARAMS"
+    alt_tokens
+)
+
+# cutlass headers using alternative operator tokens (`and`/`or`/`not`).
+# Nested inclusions (cute/int_tuple, cute/layout) are hit transitively by
+# a lot of our kernels — patch aggressively.
+set(_SGL_CUTLASS_ALT_TOKEN_FILES
+    "cutlass/conv/threadblock/conv2d_dgrad_output_gradient_tile_access_iterator_analytic.h"
+    "cutlass/conv/threadblock/conv2d_dgrad_output_gradient_tile_access_iterator_optimized.h"
+    "cutlass/exmy_base.h"
+    "cutlass/gemm/kernel/gemm_universal_decl.h"
+    "cutlass/gemm/kernel/symm_universal.h"
+    "cutlass/gemm/kernel/trmm_universal.h"
+    "cutlass/transform/kernel/sm90_sparse_gemm_compressor.hpp"
+    "cute/int_tuple.hpp"
+    "cute/layout.hpp"
+)
+foreach(_rel IN LISTS _SGL_CUTLASS_ALT_TOKEN_FILES)
+    string(REPLACE "/" "_" _markname "${_rel}")
+    string(REPLACE "." "_" _markname "${_markname}")
+    _sgl_inplace_patch(
+        "${repo-cutlass_SOURCE_DIR}/include/${_rel}"
+        "SGL_KERNEL_WIN_PATCH_CUTLASS_${_markname}"
+        alt_tokens
+    )
+    # Flash-attention pulls its own embedded copy of cutlass — patch that
+    # tree too. Path exists only if FA sources were fetched.
+    _sgl_inplace_patch(
+        "${repo-flash-attention_SOURCE_DIR}/csrc/cutlass/include/${_rel}"
+        "SGL_KERNEL_WIN_PATCH_FA_CUTLASS_${_markname}"
+        alt_tokens
+    )
+endforeach()

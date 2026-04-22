@@ -294,7 +294,7 @@ public:
     }
 
     cudaError_t result = cudaGetLastError();
-    if (cudaSuccess != result or Status::kSuccess != launch_result) {
+    if (cudaSuccess != result || Status::kSuccess != launch_result) {
       //return Status::kSuccess;
       CUTLASS_TRACE_HOST("  Kernel launch failed. Reason: " << result);
       return Status::kErrorInternal;

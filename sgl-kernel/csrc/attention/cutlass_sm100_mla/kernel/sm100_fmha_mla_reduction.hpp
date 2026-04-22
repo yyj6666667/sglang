@@ -158,7 +158,7 @@ struct Sm100FmhaMlaReductionKernel {
       sum_lse = __shfl_sync(0xffffffff, sum_lse, 0);
 
       ElementAcc global_lse = (sum_lse == 0.f || sum_lse != sum_lse) ? std::numeric_limits<ElementAcc>::infinity() : logf(sum_lse) + lse_max;
-      if (threadIdx.x == 0 and params.ptr_lse != nullptr) {
+      if (threadIdx.x == 0 && params.ptr_lse != nullptr) {
         gLSE(0) = global_lse;
       }
 
