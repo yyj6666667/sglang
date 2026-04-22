@@ -292,8 +292,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
 
   /*
-   * From csrc/moe/marlin_moe_wna16
+   * From csrc/moe/marlin_moe_wna16 — excluded on Windows (MSVC C1061).
    */
+#ifndef _MSC_VER
   m.def(
       "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
       "Tensor! b_q_weight, Tensor? b_bias_or_none, Tensor! b_scales,"
@@ -307,6 +308,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool is_k_full, bool use_atomic_add,"
       "bool use_fp32_reduce, bool is_zp_float) -> Tensor");
   m.impl("moe_wna16_marlin_gemm", torch::kCUDA, &moe_wna16_marlin_gemm);
+#endif
 
   /*
    * From csrc/speculative

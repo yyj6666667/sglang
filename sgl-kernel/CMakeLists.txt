@@ -409,6 +409,15 @@ if(SGL_KERNEL_ENABLE_MSCCLPP)
     list(APPEND SOURCES "csrc/allreduce/mscclpp_allreduce.cu")
 endif()
 
+# Marlin MoE W4A8 dispatch hits MSVC's 128-level block-nesting limit
+# (C1061) due to chained GET_IF macro expansion. Flattening the nesting
+# is a large refactor with no benefit on SM120 — drop from the Windows
+# build. The public Python wrapper is gated separately to raise a clear
+# message when the symbol is missing.
+if(WIN32)
+    list(REMOVE_ITEM SOURCES "csrc/moe/marlin_moe_wna16/ops.cu")
+endif()
+
 # (No SOURCES swap on Windows: the pinned flashinfer's norm.cu / renorm.cu
 # compile fine once vec_dtypes.cuh is shadow-patched. See CMake INCLUDES
 # block + windows_shadow_patches.cmake.)

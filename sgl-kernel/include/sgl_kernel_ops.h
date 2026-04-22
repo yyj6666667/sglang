@@ -441,8 +441,9 @@ void cutlass_w4a8_moe_mm(
     int64_t chunk_size,
     int64_t topk);
 /*
- * From csrc/moe/marlin_moe_wna16
+ * From csrc/moe/marlin_moe_wna16 — excluded on Windows (MSVC C1061).
  */
+#ifndef _MSC_VER
 torch::Tensor moe_wna16_marlin_gemm(
     torch::Tensor& a,
     std::optional<torch::Tensor> const& c_or_none,
@@ -470,6 +471,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     bool use_atomic_add,
     bool use_fp32_reduce,
     bool is_zp_float);
+#endif
 
 /*
  * From csrc/speculative

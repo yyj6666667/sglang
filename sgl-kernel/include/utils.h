@@ -381,12 +381,13 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 #ifndef USE_ROCM
 #include <c10/util/Float8_e4m3fn.h>
 using FP8_TYPE = c10::Float8_e4m3fn;
-// MSVC + nvcc rejects __declspec(__host__) __declspec(__device__) applied to
-// a variable template ("attribute __host__ does not apply here"). A
-// namespace-scope constexpr is usable from both host and device code anyway,
-// so drop the qualifier on Windows.
+// MSVC + nvcc rejects __host__ __device__ (via C10_HOST_DEVICE) applied to
+// a variable: "attribute __host__ does not apply here". Emit as a macro so
+// it's trivially usable from both host and device code without relying on
+// --expt-relaxed-constexpr variable semantics. 448.0f is
+// std::numeric_limits<c10::Float8_e4m3fn>::max().
 #ifdef _MSC_VER
-constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
+#define FP8_E4M3_MAX (448.0f)
 #else
 C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
 #endif
