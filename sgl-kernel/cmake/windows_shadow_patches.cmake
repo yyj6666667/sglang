@@ -57,14 +57,14 @@ function(_sgl_inplace_patch file_path marker label)
         # Leave a marker so the idempotency check fires next run.
         set(_content "// ${marker}\n${_content}")
     elseif(label STREQUAL "pytorch_ext_utils")
-        # __attribute__((weak)) is GCC/Clang-only; MSVC has no identical
-        # semantics. For the Python module init stub it's only used to
-        # allow multiple TUs to redefine the symbol without ODR errors,
-        # which MSVC handles via single definition per DLL anyway. Drop
-        # the attribute on Windows.
+        # __attribute__((weak)) is GCC/Clang-only. On MSVC, make the
+        # function `inline` so the compiler emits it with COMDAT linkage
+        # and the linker de-duplicates the per-TU copies. Without this,
+        # PyInit_TORCH_EXTENSION_NAME fires LNK2005 for every .obj beyond
+        # the first.
         string(REGEX REPLACE
-            "__attribute__\\(\\(weak\\)\\)[ \t]*"
-            ""
+            "__attribute__\\(\\(weak\\)\\)"
+            "inline"
             _content "${_content}")
         # Windows SDK pollution: rpcndr.h defines `small` as `char`, and
         # minwindef.h defines min/max. These bleed into torch's
