@@ -325,6 +325,8 @@ std::vector<at::Tensor> kimi_k2_moe_fused_gate(
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output);
 
+#ifndef _MSC_VER
+// fp8_blockwise_scaled_grouped_mm excluded on Windows (MSVC C1001 ICE).
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
     torch::Tensor& a_ptrs,
@@ -344,6 +346,7 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
+#endif
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,

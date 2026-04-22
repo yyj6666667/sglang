@@ -66,7 +66,13 @@ function(_sgl_inplace_patch file_path marker label)
             "__attribute__\\(\\(weak\\)\\)[ \t]*"
             ""
             _content "${_content}")
-        set(_content "// ${marker}\n${_content}")
+        # Windows SDK pollution: rpcndr.h defines `small` as `char`, and
+        # minwindef.h defines min/max. These bleed into torch's
+        # CUDACachingAllocator.h (parameter named `small`) and cutlass
+        # templates using std::min/max. Since this header is always
+        # pulled in before torch/all.h, undef them here so every TU
+        # downstream sees clean identifiers.
+        set(_content "// ${marker}\n#ifdef _MSC_VER\n#ifdef small\n#undef small\n#endif\n#ifdef min\n#undef min\n#endif\n#ifdef max\n#undef max\n#endif\n#endif\n${_content}")
     elseif(label STREQUAL "alt_tokens")
         # Rewrite C++ alternative operator tokens (`and`, `or`, `not`) to
         # their punctuation spellings. nvcc's EDG front-end on MSVC does

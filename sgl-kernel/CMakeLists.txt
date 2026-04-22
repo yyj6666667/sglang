@@ -409,13 +409,15 @@ if(SGL_KERNEL_ENABLE_MSCCLPP)
     list(APPEND SOURCES "csrc/allreduce/mscclpp_allreduce.cu")
 endif()
 
-# Marlin MoE W4A8 dispatch hits MSVC's 128-level block-nesting limit
-# (C1061) due to chained GET_IF macro expansion. Flattening the nesting
-# is a large refactor with no benefit on SM120 — drop from the Windows
-# build. The public Python wrapper is gated separately to raise a clear
-# message when the symbol is missing.
+# Windows-only exclusions.
+# - marlin_moe_wna16/ops.cu: MSVC C1061 (128-level block nesting).
+# - moe/fp8_blockwise_moe_kernel.cu: MSVC C1001 ICE on the cudafe1.stub.c
+#   intermediate under /O2 — likely an MSVC optimiser bug on heavy CUTLASS
+#   templates. No SM120-era caller for this path on single-GPU Windows;
+#   skip rather than work around the compiler.
 if(WIN32)
     list(REMOVE_ITEM SOURCES "csrc/moe/marlin_moe_wna16/ops.cu")
+    list(REMOVE_ITEM SOURCES "csrc/moe/fp8_blockwise_moe_kernel.cu")
 endif()
 
 # (No SOURCES swap on Windows: the pinned flashinfer's norm.cu / renorm.cu

@@ -245,12 +245,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "(Tensor[])");
   m.impl("kimi_k2_moe_fused_gate", torch::kCUDA, &kimi_k2_moe_fused_gate);
 
+#ifndef _MSC_VER
+  // fp8_blockwise_scaled_grouped_mm is excluded on Windows (MSVC C1001 ICE).
   m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "
       "a_scales_ptrs, Tensor b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
       "stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, Tensor problem_sizes, Tensor "
       "expert_offsets, Tensor workspace) -> ()");
   m.impl("fp8_blockwise_scaled_grouped_mm", torch::kCUDA, &fp8_blockwise_scaled_grouped_mm);
+#endif
 
   m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
