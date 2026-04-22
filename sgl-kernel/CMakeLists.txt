@@ -432,14 +432,12 @@ if(SGL_KERNEL_ENABLE_MSCCLPP)
 endif()
 
 if(WIN32)
-    # Shadow-include directory that overlays a patched vec_dtypes.cuh (and
-    # any other future per-header MSVC fixes) BEFORE the FetchContent
-    # flashinfer headers. The patched file is emitted at configure time
-    # by windows_shadow_patches.cmake.
-    set(_WIN_SHADOW_DIR "${CMAKE_CURRENT_BINARY_DIR}/windows_shadow")
+    # Apply in-place MSVC compatibility patches to FetchContent-populated
+    # vendored headers. We can't use a shadow include dir because several of
+    # the offending files are included via relative `../foo.cuh` paths that
+    # resolve against the source file's directory — bypassing `-I`.
+    # The CMake module is idempotent via marker comments.
     include(${CMAKE_CURRENT_LIST_DIR}/cmake/windows_shadow_patches.cmake)
-    # Prepend the shadow dir so patched files win header lookup.
-    list(INSERT INCLUDES 0 "${_WIN_SHADOW_DIR}")
 endif()
 
 # =========================== Common SM90 Build ============================= #

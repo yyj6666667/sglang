@@ -28,6 +28,10 @@
 
 #include <cmath>
 
+#ifdef _MSC_VER
+typedef unsigned int uint;
+#endif
+
 #define CHECK_TYPE(x, st) \
   TORCH_CHECK(x.scalar_type() == st, #x " dtype is ", x.scalar_type(), ", while ", st, " is expected")
 #define CHECK_TH_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")

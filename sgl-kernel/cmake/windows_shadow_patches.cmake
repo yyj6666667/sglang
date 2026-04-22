@@ -1,52 +1,99 @@
-# Emit patched copies of vendored headers into a Windows-only shadow
-# include dir (${_WIN_SHADOW_DIR}). Call this from the main CMakeLists.txt
-# inside an `if(WIN32)` branch AFTER FetchContent_Populate(repo-*) has run
-# so the source paths exist. The shadow dir is added with -I ahead of the
-# upstream include dirs so patched copies win.
+# Apply targeted in-place edits to the FetchContent-populated vendored
+# headers that MSVC's nvcc path can't compile as-is. Call this from the
+# main CMakeLists.txt inside an `if(WIN32)` branch AFTER FetchContent_Populate
+# has run.
 #
-# Why: sgl-kernel pins flashinfer at commit bc29697b, which still uses
-# GCC-only attribute macros (`__attribute__((always_inline)) __device__`)
-# in vec_dtypes.cuh. MSVC's nvcc path can't parse those (error: "declaration
-# is incompatible with variable template flashinfer::__attribute__"). The
-# newer flashinfer tree (local C:\flashinfer 0.6.7+) already uses
-# `__forceinline__ __device__`, but it has removed pytorch_extension_utils.h,
-# so we can't simply redirect the whole include dir. Instead we pluck the
-# problem header out, rewrite it, and shadow-include it.
+# In-place (instead of shadow-include) is required because several offending
+# headers are included via relative paths (e.g. flashinfer internal files
+# doing `#include "../vec_dtypes.cuh"`), which the compiler resolves against
+# the source file's own directory — never consulting `-I`.
 #
-# Patches: if the substitution target isn't found in a source file, we
-# emit a STATUS line and still copy verbatim (keeps Linux behaviour
-# identical when this module accidentally runs on non-Windows).
+# Each patch is idempotent via a marker comment: the second run is a no-op.
+# CMake re-runs this at every configure, so a fresh clone of the FetchContent
+# tree re-applies the patch automatically.
+#
+# Patches applied:
+# 1. flashinfer/vec_dtypes.cuh  — FLASHINFER_INLINE macro: rewrite
+#    `inline __attribute__((always_inline)) __device__` -> `__forceinline__ __device__`.
+#    MSVC's nvcc front-end mis-forwards the GCC attribute to a variable
+#    template `flashinfer::__attribute__`, yielding C2143/C3861-style parse
+#    errors throughout.
+# 2. flashinfer/math.cuh  — replace stray `ushort` typedefs with
+#    `unsigned short` (MSVC's CRT has no `ushort` alias).
 
-function(_sgl_shadow_patch_file src_path dst_path)
-    if(NOT EXISTS "${src_path}")
-        message(WARNING "sgl-kernel shadow patch: source not found: ${src_path}")
+function(_sgl_inplace_patch file_path marker label)
+    if(NOT EXISTS "${file_path}")
+        message(WARNING "sgl-kernel Windows patch: target not found: ${file_path}")
         return()
     endif()
-    file(READ "${src_path}" _content)
+    file(READ "${file_path}" _content)
+    if(_content MATCHES "${marker}")
+        # already patched
+        return()
+    endif()
+    set(_orig "${_content}")
 
-    # Replace GCC-style FLASHINFER_INLINE macro definition with a portable
-    # alternative that nvcc maps to __forceinline__ on MSVC.
-    string(REPLACE
-        "#define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__"
-        "#define FLASHINFER_INLINE __forceinline__ __device__"
-        _content "${_content}")
+    # The caller passes a function name via ${label} whose body does the
+    # actual replacements on the local _content. We do this with one of
+    # a fixed set of hard-coded transforms rather than dynamic dispatch.
+    if(label STREQUAL "vec_dtypes")
+        string(REPLACE
+            "#define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__"
+            "#define FLASHINFER_INLINE __forceinline__ __device__   // ${marker}"
+            _content "${_content}")
+        string(REGEX REPLACE
+            "inline __attribute__\\(\\(always_inline\\)\\) __device__"
+            "__forceinline__ __device__"
+            _content "${_content}")
+    elseif(label STREQUAL "math")
+        # Only replace `ushort` at word boundaries so `__half_as_ushort`,
+        # `__ushort_as_half`, etc. stay intact. CMake's regex uses `[^A-Za-z_]`
+        # lookarounds simulated via a captured prefix/suffix.
+        # Match `([^A-Za-z0-9_])ushort([^A-Za-z0-9_])` globally.
+        string(REGEX REPLACE
+            "([^A-Za-z0-9_])ushort([^A-Za-z0-9_])"
+            "\\1unsigned short\\2"
+            _content "${_content}")
+        # Leave a marker so the idempotency check fires next run.
+        set(_content "// ${marker}\n${_content}")
+    elseif(label STREQUAL "pytorch_ext_utils")
+        # __attribute__((weak)) is GCC/Clang-only; MSVC has no identical
+        # semantics. For the Python module init stub it's only used to
+        # allow multiple TUs to redefine the symbol without ODR errors,
+        # which MSVC handles via single definition per DLL anyway. Drop
+        # the attribute on Windows.
+        string(REGEX REPLACE
+            "__attribute__\\(\\(weak\\)\\)[ \t]*"
+            ""
+            _content "${_content}")
+        set(_content "// ${marker}\n${_content}")
+    else()
+        message(FATAL_ERROR "sgl-kernel Windows patch: unknown label '${label}'")
+    endif()
 
-    # Drop any other `__attribute__((always_inline))` usage that reaches
-    # the `inline __attribute__((always_inline)) __device__` pattern at
-    # function definitions. Use a compact regex.
-    string(REGEX REPLACE
-        "inline __attribute__\\(\\(always_inline\\)\\) __device__"
-        "__forceinline__ __device__"
-        _content "${_content}")
+    if(_content STREQUAL _orig)
+        message(STATUS "sgl-kernel Windows patch: no replacements made in ${file_path} (source may already use MSVC-friendly form)")
+        return()
+    endif()
 
-    get_filename_component(_dst_dir "${dst_path}" DIRECTORY)
-    file(MAKE_DIRECTORY "${_dst_dir}")
-    file(WRITE "${dst_path}" "${_content}")
+    file(WRITE "${file_path}" "${_content}")
+    message(STATUS "sgl-kernel Windows patch: rewrote ${file_path}")
 endfunction()
 
-# vec_dtypes.cuh — the single known trigger for MSVC attribute parse.
-_sgl_shadow_patch_file(
+_sgl_inplace_patch(
     "${repo-flashinfer_SOURCE_DIR}/include/flashinfer/vec_dtypes.cuh"
-    "${_WIN_SHADOW_DIR}/flashinfer/vec_dtypes.cuh"
+    "SGL_KERNEL_WIN_PATCH_VEC_DTYPES"
+    vec_dtypes
 )
-message(STATUS "sgl-kernel Windows shadow patches emitted to ${_WIN_SHADOW_DIR}")
+
+_sgl_inplace_patch(
+    "${repo-flashinfer_SOURCE_DIR}/include/flashinfer/math.cuh"
+    "SGL_KERNEL_WIN_PATCH_MATH"
+    math
+)
+
+_sgl_inplace_patch(
+    "${repo-flashinfer_SOURCE_DIR}/csrc/pytorch_extension_utils.h"
+    "SGL_KERNEL_WIN_PATCH_PYEXT"
+    pytorch_ext_utils
+)

@@ -6,6 +6,10 @@
 
 #include "pytorch_extension_utils.h"
 
+#ifdef _MSC_VER
+typedef unsigned int uint;
+#endif
+
 // Helper functions to convert between different data types
 // (float, half, bfloat16) for the merge attention states kernel.
 inline __device__ float to_float(float u) {
