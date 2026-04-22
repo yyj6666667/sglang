@@ -8,6 +8,10 @@
 
 #include <cuda/ptx>
 
+#ifdef _MSC_VER
+typedef unsigned int uint;
+#endif
+
 #include "cute/tensor.hpp"
 
 namespace expert_specialization {

@@ -21,6 +21,11 @@ limitations under the License.
 
 #ifdef _MSC_VER
 #include <intrin.h>  // _BitScanReverse / __lzcnt etc.
+// MSVC uses __FUNCSIG__ as the signature-bearing analogue of GCC's
+// __PRETTY_FUNCTION__; remap so downstream dispatch-error messages compile.
+#ifndef __PRETTY_FUNCTION__
+#define __PRETTY_FUNCTION__ __FUNCSIG__
+#endif
 #endif
 
 #ifdef USE_ROCM

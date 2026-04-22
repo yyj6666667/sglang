@@ -69,8 +69,16 @@ __global__ void merge_attn_states_kernel(
   // float s_lse = suffix_lse[head_idx * num_tokens + token_idx];
   float p_lse = prefix_lse[token_idx * num_heads + head_idx];
   float s_lse = suffix_lse[token_idx * num_heads + head_idx];
+  // On MSVC-hosted CUDA, `std::isinf` resolves to the __host__-only STL
+  // overload and fails in device code; plain `isinf` from CUDA's device
+  // runtime is the safe spelling across toolchains.
+#ifdef _MSC_VER
+  p_lse = isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
+  s_lse = isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
+#else
   p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
   s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
+#endif
 
   const float max_lse = fmaxf(p_lse, s_lse);
   p_lse = p_lse - max_lse;

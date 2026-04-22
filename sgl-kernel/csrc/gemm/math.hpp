@@ -2,10 +2,19 @@
 
 #include <climits>
 #include <iostream>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
-inline constexpr uint32_t next_pow_2(uint32_t const num) {
+inline uint32_t next_pow_2(uint32_t const num) {
   if (num <= 1) return num;
+#ifdef _MSC_VER
+  unsigned long _idx;
+  _BitScanReverse(&_idx, num - 1);
+  return 1u << ((uint32_t)_idx + 1);
+#else
   return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
+#endif
 }
 
 template <typename A, typename B>

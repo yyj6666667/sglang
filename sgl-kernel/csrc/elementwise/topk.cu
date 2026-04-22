@@ -403,12 +403,14 @@ auto get_params(
     indices_data_ptr = indices.data_ptr<int32_t>();
   }
 
+  // Positional init (not C++20 designated) — nvcc's EDG front-end on MSVC
+  // rejects designated initialisers under -std=c++17.
   return FastTopKParams{
-      .input = score.data_ptr<float>(),
-      .row_starts = row_starts_opt.has_value() ? row_starts_opt->data_ptr<int32_t>() : nullptr,
-      .indices = indices_data_ptr,
-      .lengths = lengths.data_ptr<int32_t>(),
-      .input_stride = score.stride(0),
+      /*input*/ score.data_ptr<float>(),
+      /*row_starts*/ row_starts_opt.has_value() ? row_starts_opt->data_ptr<int32_t>() : nullptr,
+      /*indices*/ indices_data_ptr,
+      /*lengths*/ lengths.data_ptr<int32_t>(),
+      /*input_stride*/ score.stride(0),
   };
 }
 
