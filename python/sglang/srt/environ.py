@@ -1,9 +1,14 @@
 import os
 import subprocess
+import tempfile
 import warnings
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from typing import Any
+
+# Platform-neutral default scratch dir. Linux keeps /tmp; Windows resolves
+# to TEMP/TMP via tempfile.
+_SCRATCH = tempfile.gettempdir()
 
 
 @contextmanager
@@ -177,7 +182,7 @@ class Envs:
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_CUDA_COREDUMP = EnvBool(False)
-    SGLANG_CUDA_COREDUMP_DIR = EnvStr("/tmp/sglang_cuda_coredumps")
+    SGLANG_CUDA_COREDUMP_DIR = EnvStr(os.path.join(_SCRATCH, "sglang_cuda_coredumps"))
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)

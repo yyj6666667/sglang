@@ -1,5 +1,7 @@
 import logging
+import os
 import sys
+import tempfile
 import threading
 import time
 from multiprocessing import shared_memory
@@ -26,7 +28,7 @@ MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
     envs.SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC.get()
 )
 
-SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
+SHM_LOCK_FILE = os.path.join(tempfile.gettempdir(), "shm_wr_lock.lock")
 
 
 class ShmSyncBuffer:

@@ -28,6 +28,16 @@
 #include "hip/hip_act_and_mul.cuh"
 #endif
 
+// Pick the implementation namespace once at file scope; then use it below
+// without a preprocessor branch inside the DISPATCH_* macro call (MSVC's
+// nvcc EDG front-end rejects `#if` inside a macro argument — GCC tolerated
+// it as an extension).
+#if USE_ROCM
+namespace sgl_act_ns = sgl_hip::activation;
+#else
+namespace sgl_act_ns = flashinfer::activation;
+#endif
+
 // Adapted from flashinfer activation
 // https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/csrc/activation.cu#L44
 
@@ -93,13 +103,8 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input) {
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
-#if USE_ROCM
-    sgl_hip::activation::act_and_mul_kernel<c_type, silu>
+    sgl_act_ns::act_and_mul_kernel<c_type, silu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
-#else
-    flashinfer::activation::act_and_mul_kernel<c_type, silu>
-        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
-#endif
     return true;
   });
 }
@@ -115,13 +120,8 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
-#if USE_ROCM
-    sgl_hip::activation::act_and_mul_kernel<c_type, gelu_tanh>
+    sgl_act_ns::act_and_mul_kernel<c_type, gelu_tanh>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
-#else
-    flashinfer::activation::act_and_mul_kernel<c_type, gelu_tanh>
-        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
-#endif
     return true;
   });
 }
@@ -137,14 +137,8 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
-#if USE_ROCM
-    sgl_hip::activation::act_and_mul_kernel<c_type, gelu>
+    sgl_act_ns::act_and_mul_kernel<c_type, gelu>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
-#else
-    flashinfer::activation::act_and_mul_kernel<c_type, gelu>
-        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
-#endif
-
     return true;
   });
 }

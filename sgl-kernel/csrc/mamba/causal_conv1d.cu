@@ -496,6 +496,21 @@ void causal_conv1d_fwd_kernel(ConvParamsBase params) {
 }
 
 
+// Helper hoisted out of BOOL_SWITCH lambda to keep preprocessor directives
+// out of a macro argument (MSVC nvcc EDG doesn't accept them there).
+template <typename KernelT>
+static inline void _sgl_set_conv1d_smem(KernelT* kernel, int kSmemSize) {
+#ifndef USE_ROCM
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+#else
+    // HIP/CUDA signature discrepancy — cast to void* for the HIP path.
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        (void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+    std::cerr << "Warning (causal_conv1d fwd launch): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
+#endif
+}
+
 template<int kNThreads, int kWidth, typename input_t, typename weight_t>
 void causal_conv1d_fwd_launch(ConvParamsBase &params, cudaStream_t stream) {
     static constexpr int kNElts = sizeof(input_t) == 4 ? 4 : 8;
@@ -508,15 +523,10 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, cudaStream_t stream) {
         auto kernel = &causal_conv1d_fwd_kernel<Ktraits>;
 
         if (kSmemSize >= 48 * 1024) {
-            #ifndef USE_ROCM
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-            #else
-            // There is a slight signature discrepancy in HIP and CUDA "FuncSetAttribute" function.
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-            std::cerr << "Warning (causal_conv1d fwd launch): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
-            #endif
+            // Hoisted out of the preprocessor-in-macro-arg pattern: nvcc EDG
+            // front-end on MSVC rejects `#ifndef` inside a BOOL_SWITCH lambda
+            // body (GCC tolerated it as an extension).
+            _sgl_set_conv1d_smem(kernel, kSmemSize);
         }
         kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
 
