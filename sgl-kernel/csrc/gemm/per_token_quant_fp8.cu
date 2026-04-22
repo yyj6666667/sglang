@@ -250,7 +250,11 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-  const int TOKENS_PER_CTA = 8;
+  // MSVC enforces stricter constexpr rules than GCC: a captured `const int`
+  // with a literal initialiser is not usable as a constant expression inside
+  // a lambda, so `constexpr int THREADS = TOKENS_PER_CTA * kWarpSize` below
+  // fails (C2131). Make it constexpr to satisfy both compilers.
+  constexpr int TOKENS_PER_CTA = 8;
   const bool use_warp_kernel = (num_tokens >= sm_count * 2 * TOKENS_PER_CTA);
   const bool use_vec16 = (hidden_dim % 16 == 0);
   const bool use_vec8 = (hidden_dim % 8 == 0);

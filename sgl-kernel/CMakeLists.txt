@@ -185,6 +185,13 @@ if(MSVC)
         "-Xcompiler=/bigobj"
         "-Xcompiler=/utf-8"
         "-Xcompiler=/permissive-"
+        # Enable MSVC's conformant preprocessor (C++17+). The legacy
+        # preprocessor mangles variadic macros: `LAUNCH_KERNEL_OUTER(T, U)`
+        # forwarding `__VA_ARGS__` through `LAUNCH_KERNEL(GROUP_SIZE, ...)`
+        # collapses `T, U` into a single first argument, leaving the
+        # second parameter empty (seen in per_token_group_quant_8bit_v2.cu
+        # as `sizeof(scalar_t, int8_t)` / `DtypeInfo<>`).
+        "-Xcompiler=/Zc:preprocessor"
         "-D_USE_MATH_DEFINES"
         "-DNOMINMAX"
         "-allow-unsupported-compiler"
