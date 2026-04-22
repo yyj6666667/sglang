@@ -15,6 +15,24 @@ limitations under the License.
 
 #pragma once
 
+// Windows SDK pollution guard — rpcndr.h defines `small` as `char`, and
+// minwindef.h defines min/max as macros. These bleed into torch's
+// CUDACachingAllocator.h (parameter named `small`) and into cutlass
+// templates using std::min/max. Undef them before <torch/all.h> is pulled
+// in by this header, so every TU downstream sees clean identifiers.
+// Linux compilers never define these, so the guards are no-ops there.
+#ifdef _MSC_VER
+#ifdef small
+#undef small
+#endif
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+#endif
+
 #include <ATen/Tensor.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
