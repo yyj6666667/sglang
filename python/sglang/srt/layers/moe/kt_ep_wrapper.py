@@ -30,7 +30,16 @@ from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda
 
 if is_cuda():
-    from sgl_kernel import gptq_marlin_repack
+    # On Linux, sgl_kernel ships a compiled gptq_marlin_repack; on Windows
+    # the sgl_kernel wheel skipped building it (FA3 / marlin_repack were
+    # deferred due to MSVC template issues). Fall back to the pure-JIT
+    # implementation under sglang.jit_kernel, which goes through tvm-ffi
+    # (fully working on Windows after the cuda-link patch in
+    # flashinfer/scripts/windows/patches/apply_tvm_ffi_patches.py).
+    try:
+        from sgl_kernel import gptq_marlin_repack
+    except ImportError:
+        from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig

@@ -288,9 +288,15 @@ bool is_valid_config(
   return cache_size + 512 <= max_shared_mem;
 }
 
+// NOTE: changed from `else if` to independent `if` — the _GET_IF chain
+// expanded to ~200+ nested else-if clauses that exceeded MSVC's C1061
+// "nesting too deep" parse-tree limit on Windows. Conditions are mutually
+// exclusive on (q_type, thread_*_blocks, group_blocks, num_threads,
+// is_zp_float), so at most one fires — semantically equivalent to the
+// else-if chain, but with per-statement parse depth 1.
 #define _GET_IF(                                                                                                       \
     W_TYPE, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8, GROUP_BLOCKS, NUM_THREADS, IS_ZP_FLOAT) \
-  else if (                                                                                                            \
+  if (                                                                                                                 \
       q_type == W_TYPE && thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS &&                  \
       thread_k_blocks == THREAD_K_BLOCKS && m_block_size_8 == M_BLOCK_SIZE_8 && group_blocks == GROUP_BLOCKS &&        \
       num_threads == NUM_THREADS && is_zp_float == IS_ZP_FLOAT) {                                                      \

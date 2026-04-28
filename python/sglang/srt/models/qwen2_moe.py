@@ -846,6 +846,15 @@ class Qwen2MoeForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    # GPTQ checkpoints emit per-expert bias tensors
+                    # (down_proj.bias / gate_proj.bias / up_proj.bias) that
+                    # FusedMoE's fused layout doesn't have a slot for.
+                    # Mirror the bias-skip that the stacked-weight branch
+                    # already applies at line ~860 below.
+                    if name.endswith(".bias") and name not in params_dict:
+                        break
+                    if name not in params_dict:
+                        break
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(

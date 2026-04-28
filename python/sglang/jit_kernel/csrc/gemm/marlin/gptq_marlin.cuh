@@ -256,9 +256,17 @@ bool is_valid_config(
   return cache_size <= max_shared_mem;
 }
 
+// NOTE: was `else if (...) { ... }` — rewritten as an independent `if`
+// statement. COMMON_GET_IF/FP4_GET_IF/BIGGROUP_GET_IF/ACT_GET_IF/FZP_GET_IF
+// together expand to ~200 _GET_IF invocations; chained as `else if`, the
+// resulting parse tree is deep enough to trigger MSVC C1061 "nesting too
+// deep". Each clause's condition is mutually exclusive on q_type +
+// thread_*_blocks + group_blocks + num_threads + is_zp_float, so at most one
+// fires — making the `if` form semantically equivalent to the original
+// chain while keeping parse-tree depth per statement at 1.
 #define _GET_IF(                                                                                                       \
     W_TYPE, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8, GROUP_BLOCKS, NUM_THREADS, IS_ZP_FLOAT) \
-  else if (                                                                                                            \
+  if (                                                                                                                 \
       q_type == W_TYPE && thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS &&                  \
       thread_k_blocks == THREAD_K_BLOCKS && m_block_size_8 == M_BLOCK_SIZE_8 && group_blocks == GROUP_BLOCKS &&        \
       num_threads == NUM_THREADS && is_zp_float == IS_ZP_FLOAT) {                                                      \
