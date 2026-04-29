@@ -2384,11 +2384,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
-        _kt_t_apply_start = time.perf_counter() if (
+        _kt_timing = (
             os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
             and self.tp_rank == 0
             and getattr(self.kt_config, "layer_idx", None) in (0, 5, 20, 35)
-        ) else None
+        )
+        _kt_t_apply_start = time.perf_counter() if _kt_timing else None
+        _kt_t_after_submit = None
+        _kt_t_after_mask = None
+        _kt_t_after_gpu = None
+        _kt_t_after_sync = None
+        _kt_t_after_merge = None
         _kt_t_cpu_wait_ms = 0.0
 
         # Check for full GPU fallback
@@ -2451,6 +2457,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 self._submit_with_staged_input(
                     layer, dispatch_output, staging_buffer
                 )
+        if _kt_timing:
+            if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
+                torch.cuda.synchronize(x.device)
+            _kt_t_after_submit = time.perf_counter()
 
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
         # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
@@ -2464,6 +2474,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         masked_dispatch_output = dispatch_output._replace(
             topk_output=masked_topk_output
         )
+        if _kt_timing:
+            if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
+                torch.cuda.synchronize(x.device)
+            _kt_t_after_mask = time.perf_counter()
 
         # Step 3: Execute GPU expert computation on main stream
         # No wait needed - staging buffer decouples CPU and GPU data access
@@ -2511,6 +2525,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         else:
             gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
             output = gpu_combine_input.hidden_states
+        if _kt_timing:
+            if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
+                torch.cuda.synchronize(x.device)
+            _kt_t_after_gpu = time.perf_counter()
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
         if self.tp_rank == 0 and self._cpu_stream is not None:
@@ -2521,13 +2539,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 if _kt_t_sync_pre is not None:
                     _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
                 self._sync_done_event.record(self._cpu_stream)
+            if _kt_timing:
+                _kt_t_after_sync = time.perf_counter()
 
             # Main stream waits for cpu_stream to complete before merging results
             torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
             output = output + cpu_output
+        if _kt_timing:
+            _kt_t_after_merge = time.perf_counter()
+            # Optional: synchronize GPU at end of apply() to capture true GPU
+            # work latency (otherwise gpu_apply Python time only captures
+            # kernel-launch CPU overhead, not actual GPU compute). DEEP mode
+            # serialises streams so per-stage numbers reflect GPU work, not
+            # async launch return.
+            if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
+                torch.cuda.synchronize(x.device)
+                _kt_t_after_merge = time.perf_counter()
 
         if _kt_t_apply_start is not None:
-            _kt_total_ms = (time.perf_counter() - _kt_t_apply_start) * 1000.0
+            _kt_total_ms = (_kt_t_after_merge - _kt_t_apply_start) * 1000.0
+            _stage_submit_ms = (_kt_t_after_submit - _kt_t_apply_start) * 1000.0
+            _stage_mask_ms = (_kt_t_after_mask - _kt_t_after_submit) * 1000.0
+            _stage_gpu_ms = (_kt_t_after_gpu - _kt_t_after_mask) * 1000.0
+            _stage_sync_ms = (
+                (_kt_t_after_sync - _kt_t_after_gpu) * 1000.0
+                if _kt_t_after_sync is not None else 0.0
+            )
+            _stage_merge_ms = (
+                (_kt_t_after_merge - _kt_t_after_sync) * 1000.0
+                if _kt_t_after_sync is not None
+                else (_kt_t_after_merge - _kt_t_after_gpu) * 1000.0
+            )
             _cls = type(self)
             if not hasattr(_cls, '_kt_layer_step'):
                 _cls._kt_layer_step = {}
@@ -2537,7 +2579,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if _step <= 16 or _step % 16 == 0:
                 print(
                     f'[kt-time] layer={_li} step={_step} '
-                    f'total={_kt_total_ms:.2f}ms cpu_wait={_kt_t_cpu_wait_ms:.2f}ms '
+                    f'total={_kt_total_ms:.2f}ms '
+                    f'submit={_stage_submit_ms:.2f} '
+                    f'mask={_stage_mask_ms:.2f} '
+                    f'gpu={_stage_gpu_ms:.2f} '
+                    f'sync={_stage_sync_ms:.2f} '
+                    f'merge={_stage_merge_ms:.2f} '
+                    f'cpu_wait={_kt_t_cpu_wait_ms:.2f}ms '
                     f'num_tokens={num_tokens}',
                     flush=True,
                 )
