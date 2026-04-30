@@ -2442,6 +2442,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 1: Copy hidden_states to staging buffer and submit CPU computation
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy
         staging_buffer = None
+        # SGLANG_KT_HYBRID_NO_CPU_STREAM=1: collapse cpu_stream onto main stream.
+        # Profile data shows cpu_wait≈0.03ms in V4 hybrid decode (CPU finishes
+        # long before GPU), so the cpu_stream / wait_event coordination
+        # contributes only overhead (Python context-manager + event record/wait
+        # per MoE layer × 43 layers). Setting this env makes submit/sync run
+        # inline on the current (main) stream — saves ~0.3ms/layer of
+        # coordination at the cost of giving up async CPU/GPU overlap (which
+        # is already wasted when CPU is faster than GPU).
+        _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
         if self.tp_rank == 0 and self._cpu_stream is not None:
             # Use shared staging buffer (shared across all MoE layers to save GPU memory)
             assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
@@ -2450,13 +2459,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # Copy to staging buffer on main stream
             staging_buffer.copy_(x, non_blocking=True)
 
-            # Fork to cpu_stream (waits for staging copy to complete)
-            self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
-            with torch.cuda.stream(self._cpu_stream):
-                # Submit uses staging_buffer, so GPU can modify original x freely
+            if _no_cpu_stream:
+                # Inline submit on main stream — no cpu_stream fork.
                 self._submit_with_staged_input(
                     layer, dispatch_output, staging_buffer
                 )
+            else:
+                # Fork to cpu_stream (waits for staging copy to complete)
+                self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
+                with torch.cuda.stream(self._cpu_stream):
+                    # Submit uses staging_buffer, so GPU can modify original x freely
+                    self._submit_with_staged_input(
+                        layer, dispatch_output, staging_buffer
+                    )
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -2532,19 +2547,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
         if self.tp_rank == 0 and self._cpu_stream is not None:
-            with torch.cuda.stream(self._cpu_stream):
-                # Use staging_buffer for sync to get correct buffer reference
+            if _no_cpu_stream:
                 _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
                 cpu_output = self._sync_with_staged_input(staging_buffer)
                 if _kt_t_sync_pre is not None:
                     _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
-                self._sync_done_event.record(self._cpu_stream)
-            if _kt_timing:
-                _kt_t_after_sync = time.perf_counter()
+                if _kt_timing:
+                    _kt_t_after_sync = time.perf_counter()
+                output = output + cpu_output
+            else:
+                with torch.cuda.stream(self._cpu_stream):
+                    # Use staging_buffer for sync to get correct buffer reference
+                    _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
+                    cpu_output = self._sync_with_staged_input(staging_buffer)
+                    if _kt_t_sync_pre is not None:
+                        _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
+                    self._sync_done_event.record(self._cpu_stream)
+                if _kt_timing:
+                    _kt_t_after_sync = time.perf_counter()
 
-            # Main stream waits for cpu_stream to complete before merging results
-            torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
-            output = output + cpu_output
+                # Main stream waits for cpu_stream to complete before merging results
+                torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
+                output = output + cpu_output
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
             # Optional: synchronize GPU at end of apply() to capture true GPU
