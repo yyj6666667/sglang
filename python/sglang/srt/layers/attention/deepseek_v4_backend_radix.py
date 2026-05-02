@@ -116,6 +116,19 @@ def _copy_metadata(
 
 
 def _create_flashmla_metadata():
+    # The installed flash_mla wheel ships only sm_90a binary; any non-Hopper
+    # capability is routed to the Triton fallback in debug_flash_mla_adapter.py
+    # (the dispatcher there swallows tile_scheduler_metadata via **_unused).
+    # Skip the import entirely on non-whitelist arches so a 5090- or Ada-only
+    # image doesn't need the flash_mla wheel installed. The whitelist is
+    # maintained in debug_flash_mla_adapter._FLASHMLA_CUDA_CAPS.
+    from sglang.srt.layers.attention.debug_flash_mla_adapter import (
+        should_use_triton_fallback,
+    )
+
+    if should_use_triton_fallback():
+        return None
+
     import flash_mla
 
     return flash_mla.get_mla_metadata()[0]

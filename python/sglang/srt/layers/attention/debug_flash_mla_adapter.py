@@ -1,23 +1,29 @@
 # DeepSeek V4 Flash attention dispatcher.
 #
 # Two backends:
-#   "kernel"  -> upstream `flash_mla` PyPI package (DeepSeek-AI / sgl-project
-#                fork). Hopper (SM_90) and datacenter Blackwell (SM_100/103)
-#                only; built from CUDA kernels using wgmma + tcgen05. On
-#                consumer Blackwell (SM_120, e.g. RTX 5090) those instructions
-#                do not exist, so we transparently route to the Triton
-#                fallback.
+#   "kernel"  -> upstream `flash_mla` PyPI package. The installed wheel's
+#                cuda*.so contains only `.target sm_90a` (Hopper); any other
+#                capability raises "Unsupported architecture" the first time
+#                the CUDA op runs. Capabilities outside the whitelist are
+#                transparently routed to the Triton fallback.
 #   "triton"  -> portable Triton kernel ported from vLLM PR #40929. Works on
 #                any arch Triton supports (>= SM_80).
 #
 # This is a sglang-side change (sglang 本身), not kt-sglang coupling: the V4
 # quantizer that produces the FP8/RoPE/ue8m0-packed KV layout already lives
 # in sglang main (PR #23600), and no upstream FlashMLA build understands that
-# layout on SM_120, so the fallback has to live next to the entrypoint.
+# layout on non-Hopper arches, so the fallback has to live next to the
+# entrypoint.
 import functools
 from typing import Any, Tuple
 
 import torch
+
+
+# Capabilities for which the upstream flash_mla wheel ships a CUDA binary.
+# Verified by `strings cuda*.so | grep '\.target'` on the installed package:
+# only `sm_90a` is present. Any other capability must take the Triton path.
+_FLASHMLA_CUDA_CAPS = {(9, 0)}
 
 
 @functools.lru_cache(maxsize=1)
@@ -27,10 +33,16 @@ def _device_capability() -> Tuple[int, int]:
     return torch.cuda.get_device_capability()
 
 
-def _should_use_triton_fallback() -> bool:
-    # SM_120 (consumer Blackwell) has no wgmma / tcgen05; upstream flash_mla
-    # builds throw "Unsupported architecture" the first time the CUDA op runs.
-    return _device_capability()[0] == 12
+def should_use_triton_fallback() -> bool:
+    # Non-whitelist capability -> route to Triton. Used by the V4 metadata
+    # factories to skip flash_mla.get_mla_metadata() on arches the wheel
+    # cannot run on, and by flash_mla_with_kvcache_entrypoint below to
+    # transparently swap the kernel implementation.
+    return _device_capability() not in _FLASHMLA_CUDA_CAPS
+
+
+# Backward-compat alias (was private until consumed by metadata factories).
+_should_use_triton_fallback = should_use_triton_fallback
 
 
 def _v4_triton_decode_dispatch(

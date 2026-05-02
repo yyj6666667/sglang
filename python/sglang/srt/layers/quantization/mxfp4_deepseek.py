@@ -48,18 +48,20 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 )
 
 
-def _use_v4_marlin_fallback() -> bool:
-    """The flashinfer TRT-LLM mxfp4 MoE kernel only ships a sm100f binary;
-    on consumer Blackwell (SM_120, e.g. RTX 5090) it raises a runtime error.
-    Detect that arch once and route MXFP4 MoE through sgl-kernel's
-    `moe_wna16_marlin_gemm` (FP4 e2m1 + group_size=32 + ue8m0 scales is
-    natively supported there, see
-    sgl-kernel/csrc/moe/marlin_moe_wna16/ops.cu:1126-1132).
-    Origin: sglang 本身.
-    """
+# Capabilities for which flashinfer's `trtllm_fp4_block_scale_routed_moe`
+# ships a working binary. flashinfer 0.6.8 only includes sm100f. Outside
+# this whitelist the dispatcher routes V4 MXFP4 MoE through the portable
+# `triton_kernels.matmul_ogs` path in `v4_triton_kernels_moe.py`. Keep
+# this in sync with the same constant in `v4_triton_kernels_moe.py`.
+_TRTLLM_FP4_CAPS = {(10, 0)}
+
+
+def _trtllm_fp4_supported() -> bool:
+    """True when the current GPU is in the trtllm fp4 binary whitelist.
+    Origin: sglang 本身."""
     if not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_capability()[0] == 12
+    return torch.cuda.get_device_capability() in _TRTLLM_FP4_CAPS
 
 
 class PackTopkIds:
@@ -239,22 +241,39 @@ class DeepSeekMxfp4MoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        # The Marlin path expects natural [w1, w3] = [gate, up] order so that
-        # silu_and_mul can compute silu(first_half) * second_half = silu(gate)
-        # * up. Branch BEFORE reorder_w1w3_to_w3w1, which is a TRT-LLM-only
-        # rearrangement.
-        # NEW (2026-04-29): V4 MXFP4 GPU MoE via OAI triton_kernels package.
-        # Activated by SGLANG_V4_USE_TRITON_KERNELS=1 to bypass marlin path
-        # which has unresolved kernel-level numerical issues on SM_120.
+        # V4 GPU MoE dispatch (capability-driven, env override available).
+        #
+        # Default: capability in `_TRTLLM_FP4_CAPS` -> trtllm path below;
+        # any other capability -> triton_kernels (this branch).
+        #
+        # Override via `SGLANG_V4_USE_TRITON_KERNELS`:
+        #   "1" -> force triton_kernels even on whitelist (debugging).
+        #   "0" -> force trtllm even off-whitelist (will fail loud — kept
+        #          as a diagnostic exit so devs can see the underlying
+        #          error rather than silently fall back).
+        #
+        # The triton_kernels branch must run BEFORE `reorder_w1w3_to_w3w1`
+        # (TRT-LLM-only weight rearrangement) so it gets natural
+        # [w1, w3] = [gate, up] order.
         # Origin: sglang 本身.
         try:
             from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
                 use_v4_triton_kernels,
+                force_disable_v4_triton_kernels,
                 convert_v4_weights_to_triton_kernels,
             )
         except Exception:
             use_v4_triton_kernels = lambda: False
-        if use_v4_triton_kernels():
+            force_disable_v4_triton_kernels = lambda: False
+            convert_v4_weights_to_triton_kernels = None
+
+        _force_tk = use_v4_triton_kernels()
+        _force_trtllm = force_disable_v4_triton_kernels()
+        _take_tk_path = (
+            convert_v4_weights_to_triton_kernels is not None
+            and (_force_tk or (not _force_trtllm and not _trtllm_fp4_supported()))
+        )
+        if _take_tk_path:
             w13_raw = layer.w13_weight.data
             w2_raw = layer.w2_weight.data
             w13_scale_raw = layer.w13_weight_scale_inv.data
@@ -288,53 +307,6 @@ class DeepSeekMxfp4MoEMethod:
             layer._v4_tk_intermediate_size = intermediate_size_tk
             layer._v4_tk_num_experts = w13_raw.shape[0]
             layer._v4_tk_path = True
-            return
-
-        if _use_v4_marlin_fallback():
-            from sglang.srt.layers.quantization.v4_marlin_moe import (
-                convert_v4_weights_to_marlin,
-            )
-
-            w13 = layer.w13_weight.data
-            w2 = layer.w2_weight.data
-            w13_scale = layer.w13_weight_scale_inv.data
-            w2_scale = layer.w2_weight_scale_inv.data
-
-            if w13_scale.dtype == torch.float32:
-                w13_scale = w13_scale.to(torch.float8_e8m0fnu)
-                w2_scale = w2_scale.to(torch.float8_e8m0fnu)
-
-            hidden_size = w13.shape[2] * 2
-            intermediate_size = w2.shape[2] * 2
-            log_info_on_rank0(
-                logger,
-                f"[v4-marlin] Converting V4 MXFP4 weights to Marlin layout "
-                f"(layer: {self.prefix}, hidden_size={hidden_size}, "
-                f"intermediate_size={intermediate_size})...",
-            )
-            (
-                w13_marlin,
-                w13_scale_marlin,
-                w2_marlin,
-                w2_scale_marlin,
-            ) = convert_v4_weights_to_marlin(
-                w13,
-                w13_scale,
-                w2,
-                w2_scale,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-            )
-            layer.w13_weight = Parameter(w13_marlin, requires_grad=False)
-            layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
-            layer.w13_weight_scale_inv = Parameter(
-                w13_scale_marlin, requires_grad=False
-            )
-            layer.w2_weight_scale_inv = Parameter(
-                w2_scale_marlin, requires_grad=False
-            )
-            layer._v4_marlin_intermediate_size = intermediate_size
-            layer._v4_marlin_path = True
             return
 
         w13_w, w13_s = reorder_w1w3_to_w3w1(
@@ -465,7 +437,7 @@ class DeepSeekMxfp4MoEMethod:
             from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
                 apply_v4_triton_kernels_moe,
             )
-            # Extract topk_ids/weights from topk_output (mirror v4_marlin_path
+            # Extract topk_ids/weights from topk_output (mirror the trtllm
             # extraction below, which happens after this dispatch).
             from sglang.srt.layers.moe.topk import TopKOutputChecker
             if TopKOutputChecker.format_is_standard(topk_output):
@@ -535,37 +507,6 @@ class DeepSeekMxfp4MoEMethod:
                 topk_ids + local_expert_offset,
                 topk_ids,
             )
-
-        if getattr(layer, "_v4_marlin_path", False):
-            from sglang.srt.layers.quantization.v4_marlin_moe import (
-                apply_v4_marlin_moe,
-            )
-
-            rsf = layer.moe_runner_config.routed_scaling_factor
-            output = apply_v4_marlin_moe(
-                hidden_states=hidden_states,
-                w13=w13,
-                w2=w2,
-                w13_scale=w13_scale,
-                w2_scale=w2_scale,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                intermediate_size=layer._v4_marlin_intermediate_size,
-                routed_scaling_factor=rsf if rsf is not None else 1.0,
-            )
-            # 2604B sub-mode adds a runtime path-checker assertion in the
-            # model (deepseek_v4.py:1169). The trtllm path bumps the counter
-            # inside its body; mirror that bump here so the assertion still
-            # passes when MoE went through the Marlin fallback.
-            # NOTE: the trtllm path also applies a `swiglu_limit` clamp via
-            # _gemm1_clamp_limit_tensor; the Marlin path currently does plain
-            # silu_and_mul without that clamp, so 2604B numerics will be
-            # slightly off vs the reference until that clamp is added.
-            if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" and (
-                self._gemm1_clamp_limit_tensor is not None
-            ):
-                deepseek_v4_moe_code_path_checker.observed += 1
-            return StandardCombineInput(hidden_states=output)
 
         packed_topk = PackTopkIds.execute(topk_ids, topk_weights)
 

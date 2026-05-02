@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_CAPS
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -84,10 +86,20 @@ def copy_metadata(
 def create_flashmla_metadata():
     if is_hip():
         return None
-    else:
-        import flash_mla
+    # SM_120 (consumer Blackwell, e.g. RTX 5090): the upstream flash_mla
+    # CUDA op never runs — V4 sparse decode is routed to the Triton fallback
+    # which discards tile_scheduler_metadata. Skip the import so a 5090-only
+    # image doesn't need the flash_mla wheel installed. Other arches unchanged.
+    from sglang.srt.layers.attention.debug_flash_mla_adapter import (
+        should_use_triton_fallback,
+    )
 
-        return flash_mla.get_mla_metadata()[0]
+    if should_use_triton_fallback():
+        return None
+
+    import flash_mla
+
+    return flash_mla.get_mla_metadata()[0]
 
 
 @dataclass
@@ -122,7 +134,22 @@ class PagedIndexerMetadata(IndexerMetadata):
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        # Use the torch reference path (no deep_gemm metadata) when:
+        #   - env SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 explicitly forces it, OR
+        #   - env not set AND current capability is outside DEEPGEMM_CAPS
+        #     (e.g. consumer Blackwell SM_120, Ada SM_89, Ampere SM_8x).
+        # Without this, get_paged_mqa_logits_metadata invokes a deep_gemm
+        # CUDA op that crashes with "Unsupported architecture" on non-Hopper
+        # / non-DC-Blackwell hardware. Origin: sglang 本身.
+        _cap = (
+            torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+        )
+        _has_dg_caps = _cap is not None and _cap in DEEPGEMM_CAPS
+        _use_torch = envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or (
+            "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH" not in os.environ
+            and not _has_dg_caps
+        )
+        if _use_torch:
             self.deep_gemm_metadata = None
         else:
             import deep_gemm

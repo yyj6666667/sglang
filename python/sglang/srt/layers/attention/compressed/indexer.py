@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
@@ -9,6 +11,7 @@ import triton.language as tl
 
 from sglang.jit_kernel.deepseek_v4 import topk_transform_512, topk_transform_512_v2
 from sglang.srt.environ import envs
+from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_CAPS
 from sglang.srt.layers.attention.compressed.metadata import (
     PagedCoreMetadata,
     PagedIndexerMetadata,
@@ -374,16 +377,32 @@ class C4IndexerBackend:
         weights = weights.squeeze(2)
         # The tilelang and torch reference impls expect a 1-D `seq_lens`
         # (assert ``shape == (batch_size,)``); only the deep_gemm path takes
-        # the 2-D ``(batch, 1)`` form. Pick the right shape per backend so
-        # SM_120 (which has to use the tilelang fallback) doesn't trip the
-        # assertion the deep_gemm-shaped tensor would.
+        # the 2-D ``(batch, 1)`` form. Pick the right shape per backend.
+        #
+        # Backend selection (capability-driven, env override):
+        #   - env SGLANG_OPT_USE_TILELANG_INDEXER=1 forces tilelang.
+        #   - env SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 forces torch.
+        #   - Otherwise: cap in DEEPGEMM_CAPS -> deep_gemm; else tilelang.
+        # Origin: sglang 本身.
+        _cap = (
+            torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+        )
+        _has_dg_caps = _cap is not None and _cap in DEEPGEMM_CAPS
+        _force_tilelang = envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+        _force_torch = envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+        _auto_tilelang = (
+            "SGLANG_OPT_USE_TILELANG_INDEXER" not in os.environ
+            and "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH" not in os.environ
+            and not _has_dg_caps
+        )
+
         seq_lens_2d = True
-        if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+        if _force_tilelang or _auto_tilelang:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
             seq_lens_2d = False
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        elif _force_torch:
             fn = fp8_paged_mqa_logits_torch
             seq_lens_2d = False
         else:

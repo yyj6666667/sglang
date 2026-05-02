@@ -2,20 +2,18 @@
 """
 V4-Flash MXFP4 GPU MoE via OpenAI's `triton_kernels` package.
 
-Alternative GPU MoE path for V4-Flash on consumer Blackwell (SM_120) where
-the marlin path has unresolved kernel-level numerical issues:
-- `use_atomic_add=True`: non-deterministic (atomic reduce order ⇒ argmax flip
-  on tight bf16 logit margins; V4-Flash CPU MoE has 4.0 logprob margin between
-  top-1 and top-2 vs ~0.1 on GPU marlin).
-- `use_atomic_add=False, use_fp32_reduce=True`: deterministic but produces
-  systematically wrong logits on SM_120 (algorithm-level bug in the marlin
-  kernel's fp32-reduce branch).
+Default GPU MoE path for V4-Flash on every capability outside the trtllm
+binary whitelist (`_TRTLLM_FP4_CAPS`, currently {(10,0)} = SM_100 datacenter
+Blackwell only). Used on consumer Blackwell (SM_120, e.g. RTX 5090), Ada
+(SM_89, e.g. L40S, RTX 4090), Hopper (SM_90), and Ampere — anywhere
+flashinfer's `trtllm_fp4_block_scale_routed_moe` lacks a CUDA binary.
 
 The OAI `triton_kernels` package's `matmul_ogs` (gather-or-scatter matmul)
 provides a clean Triton MXFP4 path that:
-- accepts FP4 packed weights + ue8m0 scales via the standard
-  `_swizzle_mxfp4` layout transformation already shipped in
-  `sglang/srt/layers/quantization/mxfp4.py`,
+- accepts FP4 packed weights + ue8m0 scales via either an upstream Hopper /
+  Blackwell-DC swizzle (`_swizzle_mxfp4` from `mxfp4.py`) or a portable
+  StridedLayout (`_swizzle_mxfp4_strided` here, used everywhere outside the
+  trtllm whitelist),
 - composes naturally with sglang's standard topk (we convert topk_ids /
   topk_weights → bitmatrix → routing_from_bitmatrix the same way the
   OAI vLLM port (PR #18595) does),
@@ -23,9 +21,15 @@ provides a clean Triton MXFP4 path that:
   bf16 MoE, so the kernel is on a tested code path; the only new
   ingredient is the FP4 weight + ue8m0 scale wiring.
 
-Origin: sglang 本身 (V4-Flash-on-SM_120 enablement).
+Origin: sglang 本身.
 
-Activated by env var `SGLANG_V4_USE_TRITON_KERNELS=1` at server launch.
+Selection (default, capability-driven; see `mxfp4_deepseek.py`):
+  cap == (10,0)             -> trtllm  (sm100f binary)
+  cap not in whitelist      -> this module (StridedLayout + simulated MXFP)
+
+Force-override env (diagnostic only):
+  SGLANG_V4_USE_TRITON_KERNELS=1 -> force this module even on (10,0)
+  SGLANG_V4_USE_TRITON_KERNELS=0 -> force trtllm even off-whitelist (fail loud)
 """
 
 from __future__ import annotations
@@ -42,10 +46,27 @@ logger = logging.getLogger(__name__)
 
 
 def use_v4_triton_kernels() -> bool:
-    """Env-var gate. Default off. When set with V4-Flash on SM_120, the
-    matmul path uses `triton_kernels.matmul_ogs` instead of the marlin
-    wrapper. Origin: sglang 本身."""
+    """Force-override gate for the V4 triton_kernels path.
+
+    Default behavior (env unset): the dispatcher in
+    `mxfp4_deepseek.process_weights_after_loading` chooses this path for any
+    capability outside `_TRTLLM_FP4_CAPS`, so this returning False does not
+    mean the path is disabled — only that no override was requested.
+
+    SGLANG_V4_USE_TRITON_KERNELS=1: force this path even on whitelisted
+    capabilities (numerical comparison / debugging).
+
+    SGLANG_V4_USE_TRITON_KERNELS=0: force trtllm even off-whitelist (will
+    fail loud with "Unsupported architecture" — kept as a diagnostic exit).
+
+    Origin: sglang 本身."""
     return os.environ.get("SGLANG_V4_USE_TRITON_KERNELS") == "1"
+
+
+def force_disable_v4_triton_kernels() -> bool:
+    """True when the user explicitly set SGLANG_V4_USE_TRITON_KERNELS=0 to
+    force trtllm even off-whitelist (diagnostic only). Origin: sglang 本身."""
+    return os.environ.get("SGLANG_V4_USE_TRITON_KERNELS") == "0"
 
 
 # -----------------------------------------------------------------------------
@@ -174,39 +195,56 @@ def _make_routing_data_v4(
 # -----------------------------------------------------------------------------
 
 
-def _is_sm120() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12
+# Capabilities for which flashinfer's `trtllm_fp4_block_scale_routed_moe`
+# ships a working binary. Verified on flashinfer 0.6.8: only sm100f.
+# Outside this set, we use the StridedLayout + simulated-MXFP non-persistent
+# matmul_ogs path here. Keep this in sync with the same constant in
+# `mxfp4_deepseek.py`.
+_TRTLLM_FP4_CAPS = {(10, 0)}
 
 
-def _patch_sm120_native_mxfp():
-    """SM_120 enablement for triton_kernels MXFP4 path. Two patches needed:
+def _use_strided_layout() -> bool:
+    """True when matmul_ogs must use StridedLayout + simulated MXFP rather
+    than the upstream Hopper-TMA / Blackwell-DC swizzle. Origin: sglang 本身.
+    """
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability() not in _TRTLLM_FP4_CAPS
 
-    (1) `target_info.has_native_mxfp()` must return False on SM_120 so
-        matmul_ogs takes the simulated MXFP non-persistent code path
-        instead of the native (TMA + cluster shared mem + tile::gather4)
-        path that needs SM_100/SM_90 features RTX 5090 doesn't have.
 
-    (2) opt_flags must force `is_persistent=False` on SM_120. The auto-
-        selection in make_opt_flags chooses persistent for larger M
-        (= prefill batches), which then collides with simulated-MXFP and
-        raises 'Must use non-persistent kernel for simulated MXFP' at
-        runtime. CG decode (small M) auto-selects non-persistent so it
-        works without this; prefill needs the explicit constraint.
+def _patch_strided_mxfp():
+    """Strided-layout enablement for triton_kernels MXFP4 path. Two patches:
 
-    Origin: sglang 本身 (triton_kernels package's Blackwell layout
-    assumes SM_100 features; SM_120 falls in a gap)."""
-    if not _is_sm120():
+    (1) `target_info.has_native_mxfp()` must return False on non-trtllm-
+        whitelist capabilities so matmul_ogs takes the simulated MXFP non-
+        persistent code path instead of the native (TMA + cluster shared
+        mem + tile::gather4) path that needs Hopper / DC-Blackwell features
+        consumer / Ada / Ampere don't have. (On SM_89/SM_80 the upstream
+        `has_native_mxfp` already returns False; force-False is a no-op
+        but cheap. On SM_120 the upstream returns True since cap[0]==12
+        is treated as Blackwell, hence the override.)
+
+    (2) opt_flags must force `is_persistent=False`. The auto-selection in
+        make_opt_flags chooses persistent for larger M (= prefill batches),
+        which then collides with simulated-MXFP and raises 'Must use non-
+        persistent kernel for simulated MXFP' at runtime. CG decode (small
+        M) auto-selects non-persistent so it works without this; prefill
+        needs the explicit constraint.
+
+    Origin: sglang 本身 (triton_kernels package's Blackwell layout assumes
+    SM_100 features; everything outside the trtllm whitelist falls in a
+    similar gap)."""
+    if not _use_strided_layout():
         return
     import triton_kernels.target_info as target_info
-    if not getattr(target_info, "_v4_sm120_patched", False):
+    if not getattr(target_info, "_v4_strided_patched", False):
         original = target_info.has_native_mxfp
-        def has_native_mxfp_sm120():
-            cap = torch.cuda.get_device_capability()
-            if cap[0] == 12:
+        def has_native_mxfp_strided():
+            if _use_strided_layout():
                 return False
             return original()
-        target_info.has_native_mxfp = has_native_mxfp_sm120
-        target_info._v4_sm120_patched = True
+        target_info.has_native_mxfp = has_native_mxfp_strided
+        target_info._v4_strided_patched = True
     # opt_flags imports has_native_mxfp into its namespace at import time;
     # refresh the binding there too. Also force is_persistent=False so the
     # auto-selector in make_opt_flags can't pick the native path.
@@ -219,10 +257,11 @@ def _patch_sm120_native_mxfp():
         pass
 
 
-def _swizzle_mxfp4_sm120_strided(quant_tensor: torch.Tensor, scale: torch.Tensor):
+def _swizzle_mxfp4_strided(quant_tensor: torch.Tensor, scale: torch.Tensor):
     """Wrap raw MXFP4 weight + ue8m0 scale into triton_kernels Tensor objects
     using StridedLayout (no swizzle), suitable for the simulated-MXFP non-
-    persistent path on SM_120 (consumer Blackwell). Origin: sglang 本身.
+    persistent path on capabilities outside the trtllm whitelist. Origin:
+    sglang 本身.
 
     Matches the API contract of sglang.srt.layers.quantization.mxfp4
     `_swizzle_mxfp4`: returns (Tensor[FP4], InFlexData(), Tensor[ue8m0])."""
@@ -258,7 +297,7 @@ def convert_v4_weights_to_triton_kernels(
     """
     from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
-    _patch_sm120_native_mxfp()
+    _patch_strided_mxfp()
 
     # Wrap raw scale as float8_e8m0fnu if it came in as uint8/float32.
     if w13_scale.dtype != torch.float8_e8m0fnu:
@@ -280,13 +319,16 @@ def convert_v4_weights_to_triton_kernels(
     if w2.dtype != torch.uint8:
         w2 = w2.view(torch.uint8)
 
-    if _is_sm120():
-        # SM_120: bypass Blackwell DC swizzle (which needs Hopper TMA);
-        # use StridedLayout + simulated MXFP non-persistent kernel.
-        w13_swiz, w13_flex, w13_scale_swiz = _swizzle_mxfp4_sm120_strided(w13, w13_scale)
-        w2_swiz, w2_flex, w2_scale_swiz = _swizzle_mxfp4_sm120_strided(w2, w2_scale)
+    if _use_strided_layout():
+        # Non-trtllm-whitelist capability: bypass Blackwell DC swizzle (which
+        # needs Hopper TMA / cluster shared mem) and use StridedLayout +
+        # simulated MXFP non-persistent kernel.
+        w13_swiz, w13_flex, w13_scale_swiz = _swizzle_mxfp4_strided(w13, w13_scale)
+        w2_swiz, w2_flex, w2_scale_swiz = _swizzle_mxfp4_strided(w2, w2_scale)
     else:
-        # SM_90 / SM_100: use the upstream swizzle from sglang.mxfp4.
+        # SM_100 (cap=(10,0)): use the upstream swizzle from sglang.mxfp4.
+        # Reached only via the SGLANG_V4_USE_TRITON_KERNELS=1 force-override;
+        # the default dispatch routes this capability to the trtllm path.
         from sglang.srt.layers.quantization.mxfp4 import _swizzle_mxfp4
         w13_swiz, w13_flex, w13_scale_swiz = _swizzle_mxfp4(w13, w13_scale, num_warps)
         w2_swiz, w2_flex, w2_scale_swiz = _swizzle_mxfp4(w2, w2_scale, num_warps)
@@ -323,18 +365,17 @@ def apply_v4_triton_kernels_moe(
 ) -> torch.Tensor:
     """Run V4 sparse MoE through `triton_kernels.matmul_ogs`.
 
-    Equivalent to apply_v4_marlin_moe() but uses OAI's matmul_ogs which is:
-      - deterministic across runs (no atomic-add reduction order issues),
-      - byte-level reproducible under same input.
+    Deterministic across runs (no atomic-add reduction order issues) and
+    byte-level reproducible under same input.
 
     Activation: silu_and_mul (V4 default), applied between the two GEMMs.
     """
     from triton_kernels.matmul_ogs import matmul_ogs
     from sgl_kernel import silu_and_mul
 
-    # Refresh SM_120 patch (cheap idempotent guard) in case apply runs in a
-    # process where target_info was re-imported.
-    _patch_sm120_native_mxfp()
+    # Refresh strided-layout patch (cheap idempotent guard) in case apply
+    # runs in a process where target_info was re-imported.
+    _patch_strided_mxfp()
 
     M, K = hidden_states.shape
     N = intermediate_size

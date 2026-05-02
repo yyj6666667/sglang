@@ -175,8 +175,11 @@ FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
 
 def _check_cutlass_block_fp8_hardware_support() -> bool:
-    """Return True if CUTLASS block FP8 is supported (Hopper or newer with CUDA 12.0+)."""
-    return is_sm90_supported() or is_blackwell_supported()
+    """Return True if CUTLASS block FP8 is supported. Hopper (SM_90) and DC
+    Blackwell (SM_100) ship working binaries; consumer Blackwell (SM_120) and
+    Ada/Ampere fall back to triton. Origin: sglang 本身 (was
+    `is_blackwell_supported()` which incorrectly included SM_120)."""
+    return is_sm90_supported() or is_sm100_supported()
 
 
 if is_blackwell_supported() and is_flashinfer_available():
@@ -262,15 +265,19 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
-    # 1. DeepGEMM (if enabled and available)
-    # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
-    # 3. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
+    # 1. DeepGEMM (if enabled and available — gated by DEEPGEMM_CAPS)
+    # 2. FlashInfer TRTLLM (if SM_100 DC Blackwell + FlashInfer; the wheel
+    #    only ships sm100f, so consumer Blackwell SM_120 must skip).
+    # 3. CUTLASS (if Hopper SM_90 or DC Blackwell SM_100 + CUDA 12.0+)
     # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. Triton (fallback)
+    # 5. Triton (fallback — used on SM_120 / SM_89 / SM_8x)
+    # Origin: sglang 本身 (was `is_blackwell_supported()` for trtllm/cutlass,
+    # which incorrectly routed consumer Blackwell SM_120 to sm100f-only
+    # binaries that crash with "Unsupported architecture").
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
-    elif is_blackwell_supported() and is_flashinfer_available():
+    elif is_sm100_supported() and is_flashinfer_available():
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
     elif _check_cutlass_block_fp8_hardware_support():
         return cutlass_w8a8_block_fp8_linear_with_fallback
