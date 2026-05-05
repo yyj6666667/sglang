@@ -379,6 +379,34 @@ def apply_v4_triton_kernels_moe(
 
     M, K = hidden_states.shape
     N = intermediate_size
+    # ===== layer0 dump (file-tag triggered) =====
+    def _l0d_read_tag():
+        try:
+            with open("/tmp/sglang_layer0_dump.tag") as _f:
+                _t = _f.read().strip()
+                return _t or None
+        except FileNotFoundError:
+            return None
+    _l0d_tag = _l0d_read_tag()
+    try:
+        import torch.distributed as _l0d_dist
+        _l0d_rank = _l0d_dist.get_rank() if _l0d_dist.is_initialized() else 0
+    except Exception:
+        _l0d_rank = 0
+    _l0d_active = (
+        bool(_l0d_tag) and _l0d_rank == 0 and M >= 2000
+        and not getattr(apply_v4_triton_kernels_moe, "_l0d_done", False)
+    )
+    if _l0d_active:
+        apply_v4_triton_kernels_moe._l0d_done = True
+        try:
+            import logging as _l0d_log
+            _l0d_log.getLogger(__name__).info(
+                f"[layer0-dump] start tag={_l0d_tag} M={M} K={K} N={N}"
+            )
+        except Exception:
+            pass
+    # ===== /layer0 dump =====
 
     # Build routing data from sglang topk → triton_kernels (RoutingData,
     # GatherIndx, ScatterIndx). Note: this rebuilds per-call. Cheap
@@ -386,6 +414,20 @@ def apply_v4_triton_kernels_moe(
     routing_data, gather_indx, scatter_indx = _make_routing_data_v4(
         topk_ids, topk_weights, num_experts
     )
+    if _l0d_active:
+        try:
+            torch.save({
+                "topk_ids": topk_ids.detach().cpu().clone(),
+                "topk_weights": topk_weights.detach().cpu().clone(),
+                "expt_hist": (routing_data.expt_hist.detach().cpu().clone()
+                              if getattr(routing_data, "expt_hist", None) is not None else None),
+                "gate_scal": (routing_data.gate_scal.detach().cpu().clone()
+                              if getattr(routing_data, "gate_scal", None) is not None else None),
+                "M": int(M), "num_experts": int(num_experts),
+            }, f"/tmp/dump_layer0_{_l0d_tag}_routing.pt")
+        except Exception as _e:
+            import logging as _ll
+            _ll.getLogger(__name__).warning(f"[layer0-dump] routing fail: {_e}")
 
     # gemm1: hidden_states (M, K) @ w13 → (M*topk, 2*N) bf16
     intermediate1 = matmul_ogs(
@@ -396,12 +438,40 @@ def apply_v4_triton_kernels_moe(
         gather_indx=gather_indx,
         precision_config=w13_pcg,
     )
+    if _l0d_active:
+        try:
+            torch.cuda.synchronize()
+            torch.save({"tensor": intermediate1.detach().cpu().clone(), "M": int(M)},
+                       f"/tmp/dump_layer0_{_l0d_tag}_mid1.pt")
+        except Exception as _e:
+            import logging as _ll
+            _ll.getLogger(__name__).warning(f"[layer0-dump] mid1 fail: {_e}")
     # intermediate1 shape: [M*topk, 2*N]
     M_topk = intermediate1.shape[0]
     intermediate2 = torch.empty(
         (M_topk, N), device=hidden_states.device, dtype=hidden_states.dtype
     )
     silu_and_mul(intermediate1.view(-1, 2 * N), intermediate2)
+    if _l0d_active:
+        try:
+            torch.cuda.synchronize()
+            torch.save({"tensor": intermediate2.detach().cpu().clone(), "M": int(M)},
+                       f"/tmp/dump_layer0_{_l0d_tag}_mid2.pt")
+        except Exception as _e:
+            import logging as _ll
+            _ll.getLogger(__name__).warning(f"[layer0-dump] mid2 fail: {_e}")
+        try:
+            _mid3 = matmul_ogs(
+                intermediate2, w2_swiz, None, routing_data,
+                scatter_indx=None, precision_config=w2_pcg,
+            )
+            torch.cuda.synchronize()
+            torch.save({"tensor": _mid3.detach().cpu().clone(), "M": int(M)},
+                       f"/tmp/dump_layer0_{_l0d_tag}_mid3.pt")
+            del _mid3
+        except Exception as _e:
+            import logging as _ll
+            _ll.getLogger(__name__).warning(f"[layer0-dump] mid3 fail: {_e}")
 
     # gemm2: (M*topk, N) @ w2 → (M, K), with gammas=topk_weights for combine
     output = matmul_ogs(
@@ -416,5 +486,18 @@ def apply_v4_triton_kernels_moe(
 
     if routed_scaling_factor != 1.0:
         output = output * routed_scaling_factor
+
+    if _l0d_active:
+        try:
+            torch.cuda.synchronize()
+            torch.save({"tensor": output.detach().cpu().clone(), "M": int(M)},
+                       f"/tmp/dump_layer0_{_l0d_tag}_out_v4tk.pt")
+            import logging as _l0d_log
+            _l0d_log.getLogger(__name__).info(
+                f"[layer0-dump] complete tag={_l0d_tag} M={M}"
+            )
+        except Exception as _e:
+            import logging as _ll
+            _ll.getLogger(__name__).warning(f"[layer0-dump] out_v4tk fail: {_e}")
 
     return output
