@@ -473,13 +473,65 @@ class DeepSeekMxfp4MoEMethod:
                 raise NotImplementedError(
                     f'triton_kernels V4 path: unsupported topk format {topk_output.format}'
                 )
-            if not envs.SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING.get():
+            # === layer0 dump (v4_tk path): expert offset + topk_ids + index map ===
+            _l0d_topk_ids_pre = topk_ids.detach().cpu().clone()
+            _l0d_offset = 0
+            _l0d_skip_map = bool(envs.SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING.get())
+            if not _l0d_skip_map:
                 local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
+                _l0d_offset = int(local_expert_offset)
                 topk_ids = torch.where(
                     topk_ids >= 0,
                     topk_ids + local_expert_offset,
                     topk_ids,
                 )
+            try:
+                def _l0d_read_tag():
+                    try:
+                        with open("/tmp/sglang_layer0_dump.tag") as _f:
+                            _t = _f.read().strip()
+                            return _t or None
+                    except FileNotFoundError:
+                        return None
+                _l0d_tag = _l0d_read_tag()
+                _M_check = int(hidden_states.shape[0]) if hasattr(hidden_states, "shape") else 0
+                try:
+                    import torch.distributed as _l0d_dist
+                    _l0d_rank = _l0d_dist.get_rank() if _l0d_dist.is_initialized() else 0
+                except Exception:
+                    _l0d_rank = 0
+                _mxd_active = (
+                    bool(_l0d_tag) and _l0d_rank == 0 and _M_check >= 2000
+                    and not getattr(self, "_mxd_l0d_done", False)
+                )
+                if _mxd_active:
+                    self._mxd_l0d_done = True
+                    _payload = {
+                        "moe_ep_rank": int(getattr(layer, "moe_ep_rank", -1)),
+                        "num_local_experts": int(getattr(layer, "num_local_experts", -1)),
+                        "num_experts": int(getattr(layer, "num_experts", -1)),
+                        "local_expert_offset": _l0d_offset,
+                        "skip_dispatcher_mapping": _l0d_skip_map,
+                        "topk_ids_pre_offset": _l0d_topk_ids_pre,
+                        "topk_ids_post_offset": topk_ids.detach().cpu().clone(),
+                        "M": _M_check,
+                        "layer_class": type(layer).__name__,
+                    }
+                    for _attr in ("gpu_index_to_logical", "logical_to_gpu_index",
+                                  "physical_to_logical_map", "logical_to_physical_map"):
+                        _t = getattr(layer, _attr, None)
+                        if _t is None:
+                            _payload[_attr] = None
+                        elif isinstance(_t, torch.Tensor):
+                            _payload[_attr] = _t.detach().cpu().clone()
+                        else:
+                            _payload[_attr + "_repr"] = repr(_t)[:500]
+                    torch.save(_payload, f"/tmp/dump_layer0_{_l0d_tag}_apply_meta.pt")
+                    import logging as _ll
+                    _ll.getLogger(__name__).info(f"[layer0-dump] apply_meta tag={_l0d_tag} M={_M_check} offset={_l0d_offset}")
+            except Exception as _e:
+                import logging as _ll
+                _ll.getLogger(__name__).warning(f"[layer0-dump] apply_meta fail: {_e}")
             rsf = layer.moe_runner_config.routed_scaling_factor
             output = apply_v4_triton_kernels_moe(
                 hidden_states=hidden_states,

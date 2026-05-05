@@ -416,15 +416,39 @@ def apply_v4_triton_kernels_moe(
     )
     if _l0d_active:
         try:
-            torch.save({
+            def _l0d_dump_obj(obj):
+                # capture all public attrs as tensor-clone or scalar/repr
+                out = {}
+                attrs = [a for a in dir(obj) if not a.startswith("_")]
+                for a in attrs:
+                    try:
+                        v = getattr(obj, a)
+                    except Exception:
+                        continue
+                    if callable(v):
+                        continue
+                    if isinstance(v, torch.Tensor):
+                        out[a] = v.detach().cpu().clone()
+                    elif isinstance(v, (int, float, bool, str, type(None))):
+                        out[a] = v
+                    elif isinstance(v, (tuple, list)):
+                        out[a] = [
+                            (x.detach().cpu().clone() if isinstance(x, torch.Tensor) else x)
+                            for x in v
+                        ]
+                    else:
+                        out[a + "_type"] = type(v).__name__
+                        out[a + "_repr"] = repr(v)[:500]
+                return out
+            _routing = {
                 "topk_ids": topk_ids.detach().cpu().clone(),
                 "topk_weights": topk_weights.detach().cpu().clone(),
-                "expt_hist": (routing_data.expt_hist.detach().cpu().clone()
-                              if getattr(routing_data, "expt_hist", None) is not None else None),
-                "gate_scal": (routing_data.gate_scal.detach().cpu().clone()
-                              if getattr(routing_data, "gate_scal", None) is not None else None),
                 "M": int(M), "num_experts": int(num_experts),
-            }, f"/tmp/dump_layer0_{_l0d_tag}_routing.pt")
+                "routing_data": _l0d_dump_obj(routing_data),
+                "gather_indx": (_l0d_dump_obj(gather_indx) if gather_indx is not None else None),
+                "scatter_indx": (_l0d_dump_obj(scatter_indx) if scatter_indx is not None else None),
+            }
+            torch.save(_routing, f"/tmp/dump_layer0_{_l0d_tag}_routing.pt")
         except Exception as _e:
             import logging as _ll
             _ll.getLogger(__name__).warning(f"[layer0-dump] routing fail: {_e}")
@@ -460,6 +484,56 @@ def apply_v4_triton_kernels_moe(
         except Exception as _e:
             import logging as _ll
             _ll.getLogger(__name__).warning(f"[layer0-dump] mid2 fail: {_e}")
+        # === w13 / w2 byte-level dump (sanity for w13; bug locator for w2) ===
+        try:
+            def _stor(t):
+                return t.storage.data if hasattr(t, "storage") else t
+            def _scale(p):
+                ws = getattr(p, "weight_scale", None)
+                return _stor(ws) if ws is not None else None
+            _w13s = _stor(w13_swiz); _w13sc = _scale(w13_pcg)
+            _w2s = _stor(w2_swiz); _w2sc = _scale(w2_pcg)
+            _bytes = {
+                "w13_shape": list(_w13s.shape), "w13_dtype": str(_w13s.dtype), "w13_stride": list(_w13s.stride()),
+                "w2_shape":  list(_w2s.shape),  "w2_dtype":  str(_w2s.dtype),  "w2_stride":  list(_w2s.stride()),
+                "w13_scale_shape": (list(_w13sc.shape) if _w13sc is not None else None),
+                "w13_scale_dtype": (str(_w13sc.dtype) if _w13sc is not None else None),
+                "w2_scale_shape":  (list(_w2sc.shape)  if _w2sc  is not None else None),
+                "w2_scale_dtype":  (str(_w2sc.dtype)   if _w2sc  is not None else None),
+                "num_experts_arg": int(num_experts),
+                "intermediate_size_arg": int(intermediate_size),
+                "M": int(M),
+            }
+            for e_idx in [0, 14, 64, 128, 200, 254, 255]:
+                if _w13s.dim() >= 3 and e_idx < _w13s.shape[0]:
+                    _bytes[f"w13_e{e_idx}"] = _w13s[e_idx].detach().cpu().clone()
+                if _w2s.dim() >= 3 and e_idx < _w2s.shape[0]:
+                    _bytes[f"w2_e{e_idx}"] = _w2s[e_idx].detach().cpu().clone()
+                if _w13sc is not None and _w13sc.dim() >= 3 and e_idx < _w13sc.shape[0]:
+                    _bytes[f"w13_scale_e{e_idx}"] = _w13sc[e_idx].detach().cpu().clone()
+                if _w2sc is not None and _w2sc.dim() >= 3 and e_idx < _w2sc.shape[0]:
+                    _bytes[f"w2_scale_e{e_idx}"] = _w2sc[e_idx].detach().cpu().clone()
+            torch.save(_bytes, f"/tmp/dump_layer0_{_l0d_tag}_w_bytes.pt")
+        except Exception as _e:
+            import logging as _ll
+            _ll.getLogger(__name__).warning(f"[layer0-dump] w_bytes fail: {_e}")
+
+        # === Probe with deterministic ones input through w2 path ===
+        # Isolates w2 kernel + weight from input (intermediate2 was bitwise-eq across runs).
+        try:
+            _ones = torch.ones_like(intermediate2)
+            _probe_ones = matmul_ogs(
+                _ones, w2_swiz, None, routing_data,
+                scatter_indx=None, precision_config=w2_pcg,
+            )
+            torch.cuda.synchronize()
+            torch.save({"tensor": _probe_ones.detach().cpu().clone(), "M": int(M)},
+                       f"/tmp/dump_layer0_{_l0d_tag}_probe_w2_ones.pt")
+            del _probe_ones, _ones
+        except Exception as _e:
+            import logging as _ll
+            _ll.getLogger(__name__).warning(f"[layer0-dump] probe_w2_ones fail: {_e}")
+
         try:
             _mid3 = matmul_ogs(
                 intermediate2, w2_swiz, None, routing_data,
