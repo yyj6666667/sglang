@@ -513,6 +513,42 @@ def apply_v4_triton_kernels_moe(
                     _bytes[f"w13_scale_e{e_idx}"] = _w13sc[e_idx].detach().cpu().clone()
                 if _w2sc is not None and _w2sc.dim() >= 3 and e_idx < _w2sc.shape[0]:
                     _bytes[f"w2_scale_e{e_idx}"] = _w2sc[e_idx].detach().cpu().clone()
+            def _dump_obj_attrs(obj, max_bytes=20_000_000, depth=1):
+                out = {}
+                if obj is None:
+                    return out
+                for a in dir(obj):
+                    if a.startswith("_"):
+                        continue
+                    try:
+                        v = getattr(obj, a)
+                    except Exception:
+                        continue
+                    if callable(v):
+                        continue
+                    if isinstance(v, torch.Tensor):
+                        if v.numel() * v.element_size() <= max_bytes:
+                            out[a] = v.detach().cpu().clone()
+                        else:
+                            out[a + "_summary"] = {"shape": list(v.shape), "dtype": str(v.dtype), "numel": v.numel()}
+                    elif isinstance(v, (int, float, bool, str, type(None))):
+                        out[a] = v
+                    elif isinstance(v, (tuple, list)):
+                        out[a] = [(x.detach().cpu().clone() if isinstance(x, torch.Tensor) else x) for x in v]
+                    else:
+                        out[a + "_type"] = type(v).__name__
+                        out[a + "_repr"] = repr(v)[:1000]
+                        if depth > 0:
+                            try:
+                                out[a + "_nested"] = _dump_obj_attrs(v, max_bytes, depth-1)
+                            except Exception:
+                                pass
+                return out
+            _bytes["w13_pcg_attrs"] = _dump_obj_attrs(w13_pcg)
+            _bytes["w2_pcg_attrs"] = _dump_obj_attrs(w2_pcg)
+            _bytes["w13_swiz_attrs"] = _dump_obj_attrs(w13_swiz)
+            _bytes["w2_swiz_attrs"] = _dump_obj_attrs(w2_swiz)
+            _bytes["routed_scaling_factor_arg"] = float(routed_scaling_factor)
             torch.save(_bytes, f"/tmp/dump_layer0_{_l0d_tag}_w_bytes.pt")
         except Exception as _e:
             import logging as _ll
@@ -533,6 +569,37 @@ def apply_v4_triton_kernels_moe(
         except Exception as _e:
             import logging as _ll
             _ll.getLogger(__name__).warning(f"[layer0-dump] probe_w2_ones fail: {_e}")
+
+        try:
+            _rep_outs = []
+            for _ri in range(3):
+                _r = matmul_ogs(
+                    intermediate2, w2_swiz, None, routing_data,
+                    scatter_indx=None, precision_config=w2_pcg,
+                )
+                torch.cuda.synchronize()
+                _rep_outs.append(_r.detach().cpu().clone())
+                del _r
+            torch.save({"runs": _rep_outs, "M": int(M)},
+                       f"/tmp/dump_layer0_{_l0d_tag}_probe_repeat.pt")
+            del _rep_outs
+        except Exception as _e:
+            import logging as _ll
+            _ll.getLogger(__name__).warning(f"[layer0-dump] probe_repeat fail: {_e}")
+
+        try:
+            _zeros = torch.zeros_like(intermediate2)
+            _probe_zeros = matmul_ogs(
+                _zeros, w2_swiz, None, routing_data,
+                scatter_indx=None, precision_config=w2_pcg,
+            )
+            torch.cuda.synchronize()
+            torch.save({"tensor": _probe_zeros.detach().cpu().clone(), "M": int(M)},
+                       f"/tmp/dump_layer0_{_l0d_tag}_probe_w2_zeros.pt")
+            del _probe_zeros, _zeros
+        except Exception as _e:
+            import logging as _ll
+            _ll.getLogger(__name__).warning(f"[layer0-dump] probe_w2_zeros fail: {_e}")
 
         try:
             _mid3 = matmul_ogs(

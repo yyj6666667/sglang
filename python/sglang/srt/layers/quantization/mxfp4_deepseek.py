@@ -502,10 +502,10 @@ class DeepSeekMxfp4MoEMethod:
                     _l0d_rank = 0
                 _mxd_active = (
                     bool(_l0d_tag) and _l0d_rank == 0 and _M_check >= 2000
-                    and not getattr(self, "_mxd_l0d_done", False)
+                    and not getattr(type(self), "_mxd_l0d_done", False)
                 )
                 if _mxd_active:
-                    self._mxd_l0d_done = True
+                    type(self)._mxd_l0d_done = True
                     _payload = {
                         "moe_ep_rank": int(getattr(layer, "moe_ep_rank", -1)),
                         "num_local_experts": int(getattr(layer, "num_local_experts", -1)),
@@ -516,7 +516,34 @@ class DeepSeekMxfp4MoEMethod:
                         "topk_ids_post_offset": topk_ids.detach().cpu().clone(),
                         "M": _M_check,
                         "layer_class": type(layer).__name__,
+                        "rsf_via_runner_config": (
+                            getattr(layer.moe_runner_config, "routed_scaling_factor", None)
+                            if hasattr(layer, "moe_runner_config") else None
+                        ),
                     }
+                    # moe_runner_config full attribute dump
+                    try:
+                        _mrc = getattr(layer, "moe_runner_config", None)
+                        if _mrc is not None:
+                            _mrc_dump = {}
+                            for _a in dir(_mrc):
+                                if _a.startswith("_"):
+                                    continue
+                                try:
+                                    _v = getattr(_mrc, _a)
+                                except Exception:
+                                    continue
+                                if callable(_v):
+                                    continue
+                                if isinstance(_v, torch.Tensor):
+                                    _mrc_dump[_a] = _v.detach().cpu().clone()
+                                elif isinstance(_v, (int, float, bool, str, type(None))):
+                                    _mrc_dump[_a] = _v
+                                else:
+                                    _mrc_dump[_a + "_repr"] = repr(_v)[:500]
+                            _payload["moe_runner_config"] = _mrc_dump
+                    except Exception as _e:
+                        _payload["moe_runner_config_err"] = repr(_e)[:300]
                     for _attr in ("gpu_index_to_logical", "logical_to_gpu_index",
                                   "physical_to_logical_map", "logical_to_physical_map"):
                         _t = getattr(layer, _attr, None)
