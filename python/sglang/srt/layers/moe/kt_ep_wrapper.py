@@ -2291,6 +2291,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
         if self.tp_rank == 0:
+            # V4-Flash 2604B SwiGLU clamp on routed experts. The full
+            # moe_runner_config (which carries swiglu_limit) does not arrive
+            # until create_moe_runner(), but the value is fully determined
+            # by the DSV4 submode env (fixed at process start), so we read
+            # it here without waiting. Matches the assert
+            # `swiglu_limit == 10` in moe_runner/deep_gemm.py:_apply_swiglu_limit
+            # and the default 10.0 set for 2604B in mxfp4_deepseek.py.
+            # Origin: kt-sglang 耦合 (carries V4-2604B limit into kt-kernel).
+            from sglang.srt.environ import envs as _envs
+            _kt_swiglu_limit = (
+                10.0 if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" else 0.0
+            )
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
@@ -2300,6 +2312,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
+                swiglu_limit=_kt_swiglu_limit,
                 numa_nodes=self.kt_config.numa_nodes,
                 weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
