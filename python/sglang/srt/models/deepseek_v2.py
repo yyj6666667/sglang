@@ -2772,6 +2772,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         tbo_subbatch_index: Optional[int] = None,
     ):
+        # [HANG-DEBUG] OP1
+        import os as _hd_os
+        import time as _hd_time
+        if _hd_os.environ.get("SGLANG_KT_MXFP4_DEBUG") == "1" and self.layer_id in (0, 1, 42):
+            try:
+                from sglang.srt.distributed import get_tensor_model_parallel_rank as _hd_rank
+                if _hd_rank() == 0:
+                    _ntok = hidden_states.shape[0] if hidden_states.dim() > 0 else 0
+                    if _ntok >= 1024 or self.layer_id in (0, 42):
+                        logger.info(f"[op-hd] T={_hd_time.perf_counter():.3f} L{self.layer_id} OP1 op_comm_prepare_attn enter num_tok={_ntok}")
+            except Exception:
+                pass
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
@@ -2787,6 +2799,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_comm_prepare_mlp(self, state):
+        # [HANG-DEBUG] OP3
+        import os as _hd_os
+        import time as _hd_time
+        if _hd_os.environ.get("SGLANG_KT_MXFP4_DEBUG") == "1" and self.layer_id in (0, 1, 42):
+            try:
+                from sglang.srt.distributed import get_tensor_model_parallel_rank as _hd_rank
+                if _hd_rank() == 0:
+                    logger.info(f"[op-hd] T={_hd_time.perf_counter():.3f} L{self.layer_id} OP3 op_comm_prepare_mlp enter (post_self_attn)")
+            except Exception:
+                pass
         state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
             self.layer_communicator.prepare_mlp(
                 state.pop("hidden_states_after_attn"),
@@ -2796,6 +2818,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_mlp(self, state):
+        # [HANG-DEBUG] OP4
+        import os as _hd_os
+        import time as _hd_time
+        if _hd_os.environ.get("SGLANG_KT_MXFP4_DEBUG") == "1" and self.layer_id in (0, 1, 42):
+            try:
+                from sglang.srt.distributed import get_tensor_model_parallel_rank as _hd_rank
+                if _hd_rank() == 0:
+                    logger.info(f"[op-hd] T={_hd_time.perf_counter():.3f} L{self.layer_id} OP4 op_mlp enter (pre_MoE)")
+            except Exception:
+                pass
         hidden_states = state.pop("hidden_states_mlp_input")
         if not (
             enable_moe_dense_fully_dp()
@@ -2976,6 +3008,19 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # [HANG-DEBUG] model forward entry
+        import os as _hd_os
+        import time as _hd_time
+        _hd_dbg = _hd_os.environ.get("SGLANG_KT_MXFP4_DEBUG") == "1"
+        if _hd_dbg:
+            try:
+                from sglang.srt.distributed import get_tensor_model_parallel_rank as _hd_rank
+                _hd_tp = _hd_rank()
+            except Exception:
+                _hd_tp = -1
+            if _hd_tp == 0:
+                _ntok = input_ids.shape[0] if input_ids is not None and input_ids.dim() > 0 else (input_embeds.shape[0] if input_embeds is not None else 0)
+                logger.info(f"[model-hd] T={_hd_time.perf_counter():.3f} M1 DeepseekV2Model.forward enter num_input_tok={_ntok}")
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -2987,6 +3032,8 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        if _hd_dbg and _hd_tp == 0:
+            logger.info(f"[model-hd] T={_hd_time.perf_counter():.3f} M2 post_embed hidden_shape={list(hidden_states.shape)}")
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -3038,6 +3085,8 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
         for i in range(normal_start_layer, normal_end_layer):
+            if _hd_dbg and _hd_tp == 0 and i in (0, 1, 2, 3, 5, 10, 20, 30, 42):
+                logger.info(f"[model-hd] T={_hd_time.perf_counter():.3f} M3 pre_layer i={i} hidden_shape={list(hidden_states.shape)}")
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
                 nullcontext()
@@ -3063,6 +3112,8 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                 )
+            if _hd_dbg and _hd_tp == 0 and i in (0, 1, 2, 3, 5, 10, 20, 30, 42):
+                logger.info(f"[model-hd] T={_hd_time.perf_counter():.3f} M4 post_layer i={i}")
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -3293,6 +3344,18 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # [HANG-DEBUG] F1
+        import os as _hd_os
+        import time as _hd_time
+        if _hd_os.environ.get("SGLANG_KT_MXFP4_DEBUG") == "1":
+            try:
+                from sglang.srt.distributed import get_tensor_model_parallel_rank as _hd_rank
+                if _hd_rank() == 0:
+                    _ntok = input_ids.shape[0] if input_ids is not None and input_ids.dim() > 0 else 0
+                    if _ntok >= 1024 or _ntok < 50:
+                        logger.info(f"[fwd-hd] T={_hd_time.perf_counter():.3f} F1 ForCausalLM.forward enter num_input_tok={_ntok}")
+            except Exception:
+                pass
         if self.nsa_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(

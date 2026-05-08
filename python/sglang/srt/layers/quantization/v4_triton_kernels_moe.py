@@ -396,6 +396,115 @@ def apply_v4_triton_kernels_moe(
         topk_ids, topk_weights, num_experts
     )
 
+    # [LAYER0-DUMP] gate by SGLANG_KT_LAYER0_DUMP=<gpu|cpu>; rank 0, first qualifying call only
+    _l0d_run = os.environ.get("SGLANG_KT_LAYER0_DUMP")
+    try:
+        import torch.distributed as _l0d_dist
+        _l0d_rank = _l0d_dist.get_rank() if _l0d_dist.is_initialized() else 0
+    except Exception:
+        _l0d_rank = 0
+    _l0d_active = (
+        bool(_l0d_run)
+        and _l0d_rank == 0
+        and M >= 2000
+        and not getattr(apply_v4_triton_kernels_moe, "_l0d_done", False)
+    )
+    if _l0d_active:
+        apply_v4_triton_kernels_moe._l0d_done = True
+
+    # [LAYER0-DUMP] dump weight stats BEFORE gemm1: detect zero/garbled w13_swiz
+    if _l0d_active:
+        try:
+            # extract underlying torch tensor data from triton_kernels.Tensor wrappers
+            _w13_data = w13_swiz.storage.data if hasattr(w13_swiz, "storage") else getattr(w13_swiz, "data", None)
+            _w13_scale_data = None
+            if hasattr(w13_pcg, "weight_scale") and w13_pcg.weight_scale is not None:
+                _ws = w13_pcg.weight_scale
+                _w13_scale_data = _ws.storage.data if hasattr(_ws, "storage") else getattr(_ws, "data", None)
+            _w2_data = w2_swiz.storage.data if hasattr(w2_swiz, "storage") else getattr(w2_swiz, "data", None)
+            _w2_scale_data = None
+            if hasattr(w2_pcg, "weight_scale") and w2_pcg.weight_scale is not None:
+                _ws2 = w2_pcg.weight_scale
+                _w2_scale_data = _ws2.storage.data if hasattr(_ws2, "storage") else getattr(_ws2, "data", None)
+            payload = {}
+            for name, t in [("w13", _w13_data), ("w13_scale", _w13_scale_data),
+                            ("w2", _w2_data), ("w2_scale", _w2_scale_data)]:
+                if t is None:
+                    payload[name] = None
+                    continue
+                payload[name + "_shape"] = list(t.shape)
+                payload[name + "_dtype"] = str(t.dtype)
+                payload[name + "_stride"] = list(t.stride())
+                payload[name + "_data_ptr"] = int(t.data_ptr())
+                # take a small slice for inspection: expert 14 first row's first 64 bytes
+                if t.dim() >= 3:
+                    try:
+                        # For w13 (post-transpose): shape [E, K_packed, 2N].
+                        # gate occupies dim 2 [:N], up occupies dim 2 [N:].
+                        # For w2: shape [E, N_packed, K]. No gate/up split (single proj).
+                        eN_last = list(t.shape)[2]
+                        half = eN_last // 2
+                        for e_idx in [0, 1, 14, 156, 169] if t.shape[0] > 169 else [0, 1]:
+                            if e_idx >= t.shape[0]:
+                                continue
+                            # bytes from first 2 rows along dim 1, dim 2 first 16 of each half
+                            try:
+                                gate_slc = t[e_idx, :2, :16].reshape(-1).contiguous().cpu().clone()
+                                up_slc   = t[e_idx, :2, half:half+16].reshape(-1).contiguous().cpu().clone()
+                                payload[f"{name}_e{e_idx}_gate_first2x16"] = gate_slc
+                                payload[f"{name}_e{e_idx}_up_first2x16"] = up_slc
+                            except Exception:
+                                pass
+                            # Whole-expert per-half nz counts
+                            try:
+                                gate_full = t[e_idx, :, :half].reshape(-1).contiguous()
+                                up_full   = t[e_idx, :, half:].reshape(-1).contiguous()
+                                payload[f"{name}_e{e_idx}_gate_nz"] = int((gate_full != 0).sum().item())
+                                payload[f"{name}_e{e_idx}_up_nz"]   = int((up_full   != 0).sum().item())
+                                payload[f"{name}_e{e_idx}_gate_numel"] = int(gate_full.numel())
+                                payload[f"{name}_e{e_idx}_up_numel"]   = int(up_full.numel())
+                            except Exception as _e:
+                                payload[f"{name}_e{e_idx}_nz_err"] = str(_e)
+                    except Exception as _slc_e:
+                        payload[name + "_slice_err"] = str(_slc_e)
+                # global stats
+                try:
+                    f = t.detach().to(torch.float32) if t.dtype != torch.uint8 else t.detach().int().to(torch.float32)
+                    payload[name + "_abs_mean"] = float(f.abs().mean().item())
+                    payload[name + "_abs_max"] = float(f.abs().max().item())
+                    payload[name + "_n_zero_bytes"] = int((t.view(-1) == 0).sum().item())
+                    payload[name + "_numel"] = int(t.numel())
+                except Exception as _e:
+                    payload[name + "_stats_err"] = str(_e)
+            torch.save(payload, f"/tmp/dump_layer0_{_l0d_run}_weights.pt")
+        except Exception as _e:
+            import sys as _s
+            _s.stderr.write(f"[layer0-dump] weights save failed: {_e}\n")
+
+    # [LAYER0-DUMP] dump routing data BEFORE gemm1 to confirm hist & topk_ids
+    if _l0d_active:
+        try:
+            _expt_hist = routing_data.expt_hist
+            _gate_scal = routing_data.gate_scal
+            _src = gather_indx.src_indx if gather_indx is not None else None
+            torch.save(
+                {
+                    "topk_ids": topk_ids.detach().cpu().clone(),
+                    "topk_weights": topk_weights.detach().cpu().clone(),
+                    "expt_hist": _expt_hist.detach().cpu().clone() if _expt_hist is not None else None,
+                    "gate_scal": _gate_scal.detach().cpu().clone() if _gate_scal is not None else None,
+                    "gather_src_indx": _src.detach().cpu().clone() if _src is not None else None,
+                    "M": int(M),
+                    "num_experts": int(num_experts),
+                    "n_expts_act": int(routing_data.n_expts_act),
+                    "_v4_tk_active": True,
+                },
+                f"/tmp/dump_layer0_{_l0d_run}_routing.pt",
+            )
+        except Exception as _e:
+            import sys as _s
+            _s.stderr.write(f"[layer0-dump] routing save failed: {_e}\n")
+
     # gemm1: hidden_states (M, K) @ w13 → (M*topk, 2*N) bf16
     intermediate1 = matmul_ogs(
         hidden_states,
@@ -405,21 +514,74 @@ def apply_v4_triton_kernels_moe(
         gather_indx=gather_indx,
         precision_config=w13_pcg,
     )
+    if _l0d_active:
+        try:
+            torch.cuda.synchronize()
+            torch.save(
+                {
+                    "tensor": intermediate1.detach().cpu().clone(),
+                    "shape": list(intermediate1.shape),
+                    "dtype": str(intermediate1.dtype),
+                    "M": int(M),
+                    "stage": "mid1",
+                },
+                f"/tmp/dump_layer0_{_l0d_run}_mid1.pt",
+            )
+        except Exception as _e:
+            import sys as _s
+            _s.stderr.write(f"[layer0-dump] mid1 save failed: {_e}\n")
+
     # intermediate1 shape: [M*topk, 2*N]; layout = [gate, up] along last dim.
     # We skipped reorder_w1w3_to_w3w1 for this path so the natural [w1, w3]
     # = [gate, up] order from the checkpoint is preserved.
     if swiglu_limit is not None:
-        # 2604B asymmetric SwiGLU clamp. View slices and clamp_ in place to
-        # avoid chunk+cat copy; safe because intermediate1 is a fresh
-        # matmul_ogs output, not a cached buffer.
         N_int = intermediate1.shape[-1] // 2
         intermediate1[..., :N_int].clamp_(max=swiglu_limit)
         intermediate1[..., N_int:].clamp_(min=-swiglu_limit, max=swiglu_limit)
     M_topk = intermediate1.shape[0]
+    # [LAYER0-DUMP] dump gate / up / silu_g sub-stages BEFORE silu_and_mul
+    if _l0d_active:
+        try:
+            _N_half = intermediate1.shape[1] // 2
+            _gate = intermediate1[:, :_N_half]
+            _up = intermediate1[:, _N_half:]
+            _silu_g = torch.nn.functional.silu(_gate.float()).to(intermediate1.dtype)
+            torch.cuda.synchronize()
+            torch.save(
+                {"tensor": _gate.detach().cpu().clone(), "stage": "gate", "M": int(M)},
+                f"/tmp/dump_layer0_{_l0d_run}_gate.pt",
+            )
+            torch.save(
+                {"tensor": _up.detach().cpu().clone(), "stage": "up", "M": int(M)},
+                f"/tmp/dump_layer0_{_l0d_run}_up.pt",
+            )
+            torch.save(
+                {"tensor": _silu_g.detach().cpu().clone(), "stage": "silu_g", "M": int(M)},
+                f"/tmp/dump_layer0_{_l0d_run}_silu_g.pt",
+            )
+        except Exception as _e:
+            import sys as _s
+            _s.stderr.write(f"[layer0-dump] gate/up/silu_g save failed: {_e}\n")
     intermediate2 = torch.empty(
         (M_topk, N), device=hidden_states.device, dtype=hidden_states.dtype
     )
     silu_and_mul(intermediate1.view(-1, 2 * N), intermediate2)
+    if _l0d_active:
+        try:
+            torch.cuda.synchronize()
+            torch.save(
+                {
+                    "tensor": intermediate2.detach().cpu().clone(),
+                    "shape": list(intermediate2.shape),
+                    "dtype": str(intermediate2.dtype),
+                    "M": int(M),
+                    "stage": "mid2",
+                },
+                f"/tmp/dump_layer0_{_l0d_run}_mid2.pt",
+            )
+        except Exception as _e:
+            import sys as _s
+            _s.stderr.write(f"[layer0-dump] mid2 save failed: {_e}\n")
 
     # gemm2: (M*topk, N) @ w2 → (M, K), with gammas=topk_weights for combine
     output = matmul_ogs(
@@ -434,5 +596,27 @@ def apply_v4_triton_kernels_moe(
 
     if routed_scaling_factor != 1.0:
         output = output * routed_scaling_factor
+
+    if _l0d_active:
+        try:
+            torch.cuda.synchronize()
+            torch.save(
+                {
+                    "tensor": output.detach().cpu().clone(),
+                    "shape": list(output.shape),
+                    "dtype": str(output.dtype),
+                    "M": int(M),
+                    "stage": "out_v4tk",
+                    "routed_scaling_factor": float(routed_scaling_factor),
+                },
+                f"/tmp/dump_layer0_{_l0d_run}_out_v4tk.pt",
+            )
+            import sys as _s
+            _s.stderr.write(
+                f"[layer0-dump] saved mid1/mid2/out_v4tk run={_l0d_run} M={M}\n"
+            )
+        except Exception as _e:
+            import sys as _s
+            _s.stderr.write(f"[layer0-dump] out_v4tk save failed: {_e}\n")
 
     return output

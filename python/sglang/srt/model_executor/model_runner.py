@@ -2431,6 +2431,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # [HANG-DEBUG] R1
+        import os as _hd_os
+        import time as _hd_time
+        if _hd_os.environ.get("SGLANG_KT_MXFP4_DEBUG") == "1":
+            try:
+                from sglang.srt.distributed import get_tensor_model_parallel_rank as _hd_rank
+                if _hd_rank() == 0:
+                    _ntok = forward_batch.input_ids.shape[0] if forward_batch.input_ids is not None and forward_batch.input_ids.dim() > 0 else 0
+                    if _ntok >= 1024 or _ntok < 50:
+                        logger.info(f"[runner-hd] T={_hd_time.perf_counter():.3f} R1 ModelRunner.forward enter num_tok={_ntok} mode={forward_batch.forward_mode}")
+            except Exception:
+                pass
         self.forward_pass_id += 1
 
         with get_global_expert_distribution_recorder().with_forward_pass(

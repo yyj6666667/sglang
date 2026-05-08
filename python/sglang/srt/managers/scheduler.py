@@ -1118,9 +1118,17 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        # [HANG-DEBUG] S0 imports + helper
+        import os as _hd_os
+        import time as _hd_time
+        _hd_dbg = _hd_os.environ.get("SGLANG_KT_MXFP4_DEBUG") == "1"
+        _hd_iter = 0
         while True:
+            _hd_iter += 1
             # Receive requests
             recv_reqs = self.recv_requests()
+            if _hd_dbg and self.tp_rank == 0 and recv_reqs:
+                logger.info(f"[sched-hd] T={_hd_time.perf_counter():.3f} S2 recv_requests got {len(recv_reqs)} reqs iter={_hd_iter}")
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1128,9 +1136,17 @@ class Scheduler(
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            if _hd_dbg and self.tp_rank == 0 and batch is not None:
+                _bnum = sum(len(getattr(r, 'input_ids', []) or []) for r in batch.reqs) if batch.reqs else 0
+                if _bnum >= 1024 or batch.forward_mode == ForwardMode.EXTEND:
+                    logger.info(f"[sched-hd] T={_hd_time.perf_counter():.3f} S3 get_next_batch_to_run -> reqs={len(batch.reqs)} total_input_tok={_bnum} mode={batch.forward_mode}")
 
             # Launch the current batch
             if batch:
+                if _hd_dbg and self.tp_rank == 0:
+                    _bnum2 = sum(len(getattr(r, 'input_ids', []) or []) for r in batch.reqs) if batch.reqs else 0
+                    if _bnum2 >= 1024 or batch.forward_mode == ForwardMode.EXTEND:
+                        logger.info(f"[sched-hd] T={_hd_time.perf_counter():.3f} S4 run_batch enter reqs={len(batch.reqs)} total_input_tok={_bnum2}")
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:

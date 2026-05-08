@@ -1020,6 +1020,14 @@ class SharedFullContext:
         target_cpu = num_cpus - 1 - tp_rank
         os.sched_setaffinity(0, {target_cpu})
 
+        # [HANG-DEBUG] entry instrumentation
+        _hd = os.environ.get("SGLANG_KT_MXFP4_DEBUG") == "1"
+        _hd_layer = getattr(self, "_hd_layer_counter", 0)
+        if _hd:
+            self._hd_layer_counter = _hd_layer + 1
+            _mem_gb = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+            logger.info(f"[mxfp4-hd] enter call#{_hd_layer} tp{tp_rank} mem={_mem_gb:.2f}GB")
+
         layer = self.gpu_layer
         num_experts = layer.num_experts
         device = layer.w13_weight.device
@@ -1044,6 +1052,9 @@ class SharedFullContext:
             # Fallback: all experts from CPU
             cpu_expert_ids = list(range(num_experts))
 
+        if _hd:
+            logger.info(f"[mxfp4-hd] call#{_hd_layer} tp{tp_rank} phase1_start gpu_n={len(gpu_expert_ids)} cpu_n={len(cpu_expert_ids)}")
+
         # --- Phase 1: Copy GPU experts directly (fast GPU-to-GPU) ---
         if gpu_expert_ids:
             for e in gpu_expert_ids:
@@ -1051,6 +1062,9 @@ class SharedFullContext:
                 for name, _, dst in weight_infos:
                     src = getattr(original_layer, name)  # [num_gpu_experts, ...]
                     dst[e].copy_(src[gpu_idx], non_blocking=True)
+
+        if _hd:
+            logger.info(f"[mxfp4-hd] call#{_hd_layer} tp{tp_rank} phase1_done")
 
         # --- Phase 2: Transfer CPU experts via KT pipeline ---
         if cpu_expert_ids:
@@ -1125,9 +1139,16 @@ class SharedFullContext:
             for idx, e in enumerate(cpu_expert_ids):
                 slot = idx % 2  # Double buffering based on iteration index
 
+                if _hd and (idx % 16 == 0):
+                    logger.info(f"[mxfp4-hd] call#{_hd_layer} tp{tp_rank} phase2_loop idx={idx}/{len(cpu_expert_ids)}")
+
                 # Sync write for expert e, submit write for next CPU expert
                 if do_write:
+                    if _hd and (idx % 16 == 0):
+                        logger.info(f"[mxfp4-hd] call#{_hd_layer} tp{tp_rank} phase2 idx={idx} pre_sync_write")
                     wrapper.sync_write_weight_scale_to_buffer()
+                    if _hd and (idx % 16 == 0):
+                        logger.info(f"[mxfp4-hd] call#{_hd_layer} tp{tp_rank} phase2 idx={idx} post_sync_write")
                     if idx + 1 < len(cpu_expert_ids):
                         next_slot = (idx + 1) % 2
                         # Before writing to next_slot, ensure copy from that slot is complete.
@@ -1137,7 +1158,11 @@ class SharedFullContext:
 
                 # Barrier to ensure all ranks see the written data
                 if dist.is_initialized():
+                    if _hd and (idx % 16 == 0):
+                        logger.info(f"[mxfp4-hd] call#{_hd_layer} tp{tp_rank} phase2 idx={idx} pre_barrier")
                     dist.barrier(group=get_tp_group().device_group)
+                    if _hd and (idx % 16 == 0):
+                        logger.info(f"[mxfp4-hd] call#{_hd_layer} tp{tp_rank} phase2 idx={idx} post_barrier")
 
                 with torch.cuda.stream(copy_stream):
                     for _, cpu_buf, gpu_t in weight_infos:
@@ -1155,13 +1180,22 @@ class SharedFullContext:
                 post_stream.wait_event(events[-1])
                 postprocess_expert(len(cpu_expert_ids) - 1)
 
+            if _hd:
+                logger.info(f"[mxfp4-hd] call#{_hd_layer} tp{tp_rank} phase2_pre_wait_stream")
             torch.cuda.current_stream(device).wait_stream(post_stream)
+            if _hd:
+                logger.info(f"[mxfp4-hd] call#{_hd_layer} tp{tp_rank} phase2_done")
 
         # --- Phase 3: MXFP4-only layer-level swizzle ---
         # 必须放在 Phase 1+2 stream 同步之后；包装是 metadata-only（StridedLayout
         # no-op + Python wrapper），每次重做完整覆盖 _v4_tk_w13 / _v4_tk_w13_pcg /
         # _v4_tk_w2 / _v4_tk_w2_pcg。Origin: sglang 本身.
+        if _hd:
+            logger.info(f"[mxfp4-hd] call#{_hd_layer} tp{tp_rank} phase3_start")
         self.gpu_method.process_weights_after_loading(self.gpu_layer)
+        if _hd:
+            _mem_gb2 = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+            logger.info(f"[mxfp4-hd] call#{_hd_layer} tp{tp_rank} phase3_done mem={_mem_gb2:.2f}GB")
 
     def _prepare_weight_fp8_channel(self, wrapper, original_layer=None, gpu_experts_mask=None,
                                      logical_to_gpu_index=None):
@@ -2635,6 +2669,47 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+
+        # [LAYER0-DUMP] gate by SGLANG_KT_LAYER0_DUMP=<gpu|cpu>; tp0, layer0, M>=2000 only
+        _l0d_run = os.environ.get("SGLANG_KT_LAYER0_DUMP")
+        if (
+            _l0d_run
+            and self.tp_rank == 0
+            and getattr(self.kt_config, "layer_idx", -1) == 0
+            and num_tokens >= 2000
+        ):
+            try:
+                _l0d_payload = {
+                    "tensor": x.detach().cpu().clone(),
+                    "shape": list(x.shape),
+                    "dtype": str(x.dtype),
+                    "M": int(num_tokens),
+                    "layer_idx": 0,
+                    "topk_ids": topk_output.topk_ids.detach().cpu().clone(),
+                    "topk_weights": topk_output.topk_weights.detach().cpu().clone(),
+                    "gpu_index_to_logical": (
+                        self.gpu_index_to_logical.detach().cpu().clone()
+                        if isinstance(getattr(self, "gpu_index_to_logical", None), torch.Tensor)
+                        else None
+                    ),
+                    "gpu_experts_mask": (
+                        self.gpu_experts_mask.detach().cpu().clone()
+                        if isinstance(getattr(self, "gpu_experts_mask", None), torch.Tensor)
+                        else None
+                    ),
+                    "num_gpu_experts": int(getattr(self, "num_gpu_experts", -1)),
+                }
+                torch.save(_l0d_payload, f"/tmp/dump_layer0_{_l0d_run}_hs_in.pt")
+                logger.info(f"[layer0-dump] saved hs_in run={_l0d_run} M={num_tokens}")
+            except Exception as _l0d_e:
+                logger.warning(f"[layer0-dump] hs_in save failed: {_l0d_e}")
+
+        # [HANG-DEBUG] apply() entry instrumentation
+        if os.environ.get("SGLANG_KT_MXFP4_DEBUG") == "1" and self.tp_rank == 0:
+            _li = getattr(self.kt_config, "layer_idx", -1)
+            if _li in (0, 1, 42) or num_tokens >= self.gpu_prefill_token_threshold:
+                logger.info(f"[apply-hd] layer={_li} num_tok={num_tokens} thresh={self.gpu_prefill_token_threshold} fallback_supp={hasattr(layer, 'w13_weight') or hasattr(layer, 'w13_weight_packed') or getattr(layer, '_v4_tk_path', False)}")
+
         _kt_timing = (
             os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
             and self.tp_rank == 0
@@ -2675,6 +2750,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             compute_time = (time.perf_counter() - t_compute) * 1000.0
+
+            # [LAYER0-DUMP] GPU prefill terminal output
+            _l0d_run = os.environ.get("SGLANG_KT_LAYER0_DUMP")
+            if (
+                _l0d_run
+                and self.tp_rank == 0
+                and getattr(self.kt_config, "layer_idx", -1) == 0
+                and num_tokens >= 2000
+            ):
+                try:
+                    _hs_out = result.hidden_states
+                    torch.save(
+                        {
+                            "tensor": _hs_out.detach().cpu().clone(),
+                            "shape": list(_hs_out.shape),
+                            "dtype": str(_hs_out.dtype),
+                            "M": int(num_tokens),
+                            "layer_idx": 0,
+                            "path": "gpu_prefill",
+                        },
+                        f"/tmp/dump_layer0_{_l0d_run}_hs_out_gpu.pt",
+                    )
+                    logger.info(
+                        f"[layer0-dump] saved hs_out_gpu run={_l0d_run} M={num_tokens}"
+                    )
+                except Exception as _l0d_e:
+                    logger.warning(f"[layer0-dump] hs_out_gpu save failed: {_l0d_e}")
 
             # Dynamic expert update: analyze batch and update GPU experts.
             # Skip for V4-Flash MXFP4 — `_update_gpu_experts_from_batch` →
@@ -2870,6 +2972,32 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     _stage_mask_ms, _stage_gpu_ms, _stage_sync_ms,
                     _stage_merge_ms, _kt_t_cpu_wait_ms, num_tokens,
                 )
+
+        # [LAYER0-DUMP] hybrid path terminal output (post CPU+GPU merge)
+        _l0d_run = os.environ.get("SGLANG_KT_LAYER0_DUMP")
+        if (
+            _l0d_run
+            and self.tp_rank == 0
+            and getattr(self.kt_config, "layer_idx", -1) == 0
+            and num_tokens >= 2000
+        ):
+            try:
+                torch.save(
+                    {
+                        "tensor": output.detach().cpu().clone(),
+                        "shape": list(output.shape),
+                        "dtype": str(output.dtype),
+                        "M": int(num_tokens),
+                        "layer_idx": 0,
+                        "path": "hybrid",
+                    },
+                    f"/tmp/dump_layer0_{_l0d_run}_hs_out_hyb.pt",
+                )
+                logger.info(
+                    f"[layer0-dump] saved hs_out_hyb run={_l0d_run} M={num_tokens}"
+                )
+            except Exception as _l0d_e:
+                logger.warning(f"[layer0-dump] hs_out_hyb save failed: {_l0d_e}")
         return StandardCombineInput(hidden_states=output)
 
     def _update_gpu_experts_from_batch(
