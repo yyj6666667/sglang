@@ -478,10 +478,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
+        from sglang.srt._hang_debug import hlog
+        _rid = getattr(obj, "rid", None)
+        hlog("TOK", "generate_enter", rid=_rid, is_single=getattr(obj, "is_single", None))
         self.auto_create_handle_loop()
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        hlog("TOK", "normalized", rid=_rid)
 
         self._req_stats_init(obj, request)
         if self.server_args.language_only:
@@ -492,22 +496,33 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Log the request
         self.request_logger.log_received_request(obj, self.tokenizer, request)
 
+        hlog("TOK", "wait_pause_cond_enter", rid=_rid, is_pause=self.is_pause)
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+        hlog("TOK", "wait_pause_cond_exit", rid=_rid)
 
+        hlog("TOK", "model_update_lock_enter", rid=_rid)
         async with self.model_update_lock.reader_lock:
+            hlog("TOK", "model_update_lock_acquired", rid=_rid)
             await self._validate_and_resolve_lora(obj)
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
+                hlog("TOK", "tokenize_one_start", rid=_rid)
                 tokenized_obj = await self._tokenize_one_request(obj)
+                hlog("TOK", "tokenize_one_done", rid=_rid,
+                     n_tok=len(getattr(tokenized_obj, "input_ids", []) or []))
                 state = self.rid_to_state[obj.rid]
                 self._send_one_request(tokenized_obj)
+                hlog("TOK", "wait_one_response_start", rid=_rid)
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
+                hlog("TOK", "wait_one_response_done", rid=_rid)
             else:
+                hlog("TOK", "batch_request_start", rid=_rid)
                 async for response in self._handle_batch_request(obj, request):
                     yield response
+                hlog("TOK", "batch_request_done", rid=_rid)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -1051,10 +1066,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
+        from sglang.srt._hang_debug import hlog
+        _rid = getattr(tokenized_obj, "rid", None)
+        hlog("TOK", "send_one_pre", rid=_rid)
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+        hlog("TOK", "send_one_post", rid=_rid)
 
     def _send_batch_request(
         self,
@@ -1079,14 +1098,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         request: Optional[fastapi.Request] = None,
     ):
         """Wait for the response of one request."""
+        from sglang.srt._hang_debug import hlog, hbeat
+        _rid = getattr(obj, "rid", None)
+        hlog("TOK", "wait_loop_enter", rid=_rid, timeout=_REQUEST_STATE_WAIT_TIMEOUT)
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
         while True:
+            hbeat(f"wait_{_rid}", "TOK", "wait_event_iter", every_seconds=2.0,
+                  rid=_rid, finished=state.finished, n_out=len(state.out_list))
             try:
                 await asyncio.wait_for(
                     state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
                 )
             except asyncio.TimeoutError:
+                hlog("TOK", "wait_event_timeout", rid=_rid,
+                     finished=state.finished, n_out=len(state.out_list))
                 if (
                     request is not None
                     and not obj.background
