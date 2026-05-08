@@ -68,6 +68,70 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 
+# ---------------------------------------------------------------------------
+# KT prefill-fallback tracer.
+#
+# Drops a [KT_TRACE] line per pipeline checkpoint to stderr (and to
+# $SGLANG_KT_TRACE_LOG, default /tmp/sglang_kt_trace.log). The last line
+# printed before the server hangs identifies the exact wedge: dist.barrier,
+# wrapper.sync_write_weight_scale_to_buffer, events[idx-1].synchronize,
+# the per-expert copy, gpu_method.process_weights_after_loading, etc.
+#
+# Set SGLANG_KT_TRACE=0 to disable. The cost is ~1 syscall per checkpoint
+# (~hundreds per layer's prefill load), negligible compared to the ms-scale
+# work each step does.
+# ---------------------------------------------------------------------------
+import sys as _sys
+import threading as _threading
+
+_KT_TRACE_ENABLED = os.environ.get("SGLANG_KT_TRACE", "1") != "0"
+_KT_TRACE_PATH = os.environ.get("SGLANG_KT_TRACE_LOG", "/tmp/sglang_kt_trace.log")
+_KT_TRACE_LOCK = _threading.Lock()
+_KT_TRACE_FH = None
+_KT_TRACE_T0 = time.time()
+
+
+def _kt_trace_open():
+    global _KT_TRACE_FH
+    if _KT_TRACE_FH is None:
+        try:
+            _KT_TRACE_FH = open(_KT_TRACE_PATH, "a", buffering=1)
+        except Exception:
+            _KT_TRACE_FH = False
+    return _KT_TRACE_FH or None
+
+
+def _kt_trace(msg, **kw):
+    if not _KT_TRACE_ENABLED:
+        return
+    try:
+        rank = get_tensor_model_parallel_rank()
+    except Exception:
+        rank = -1
+    parts = [
+        "[KT_TRACE]",
+        f"t={time.time() - _KT_TRACE_T0:08.3f}",
+        f"r{rank}",
+        msg,
+    ]
+    for k, v in kw.items():
+        parts.append(f"{k}={v}")
+    line = " ".join(str(p) for p in parts) + "\n"
+    with _KT_TRACE_LOCK:
+        try:
+            _sys.stderr.write(line)
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        fh = _kt_trace_open()
+        if fh is not None:
+            try:
+                fh.write(line)
+                fh.flush()
+            except Exception:
+                pass
+
+
 logger = logging.getLogger(__name__)
 
 # Global cache for GPU experts masks (initialized once per session)
@@ -987,7 +1051,7 @@ class SharedFullContext:
     # The conversion is handled separately in the normal weight loading path.
 
     def _prepare_weight_mxfp4(self, wrapper, original_layer=None, gpu_experts_mask=None,
-                              logical_to_gpu_index=None):
+                              logical_to_gpu_index=None, _layer_idx="?"):
         """Prepare V4-Flash MXFP4 weights by writing from KT and copying to GPU.
 
         Pipeline: write(e+1) || copy(e) || postprocess(e-1)
@@ -1014,6 +1078,7 @@ class SharedFullContext:
 
         Origin: sglang 本身 (V4-Flash full-GPU prefill fallback compat).
         """
+        _kt_trace("prep_mxfp4.entry", L=_layer_idx)
         # Bind Python thread to specific CPU core (last cores for each rank)
         tp_rank = get_tensor_model_parallel_rank()
         num_cpus = os.cpu_count()
@@ -1044,16 +1109,27 @@ class SharedFullContext:
             # Fallback: all experts from CPU
             cpu_expert_ids = list(range(num_experts))
 
+        _kt_trace(
+            "prep_mxfp4.split_done",
+            L=_layer_idx,
+            n_gpu_experts=len(gpu_expert_ids),
+            n_cpu_experts=len(cpu_expert_ids),
+            num_experts=num_experts,
+        )
+
         # --- Phase 1: Copy GPU experts directly (fast GPU-to-GPU) ---
+        _kt_trace("prep_mxfp4.phase1.pre", L=_layer_idx, n=len(gpu_expert_ids))
         if gpu_expert_ids:
             for e in gpu_expert_ids:
                 gpu_idx = logical_to_gpu_index[e].item()
                 for name, _, dst in weight_infos:
                     src = getattr(original_layer, name)  # [num_gpu_experts, ...]
                     dst[e].copy_(src[gpu_idx], non_blocking=True)
+        _kt_trace("prep_mxfp4.phase1.post", L=_layer_idx)
 
         # --- Phase 2: Transfer CPU experts via KT pipeline ---
         if cpu_expert_ids:
+            _kt_trace("prep_mxfp4.phase2.setup_streams", L=_layer_idx)
             # Pipeline: write(e+1) || copy(e) || postprocess(e-1)
             copy_stream = torch.cuda.Stream(device=device)
             post_stream = torch.cuda.Stream(device=device)
@@ -1070,6 +1146,7 @@ class SharedFullContext:
             # Prepare write pipeline (rank 0 only)
             tp_world_size = get_tensor_model_parallel_world_size()
             do_write = tp_rank == 0 and wrapper is not None
+            _kt_trace("prep_mxfp4.phase2.do_write", L=_layer_idx, do_write=do_write, world=tp_world_size)
 
             if do_write:
                 # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
@@ -1120,29 +1197,52 @@ class SharedFullContext:
                     )
 
                 # Submit first CPU expert ahead of time
+                _kt_trace(
+                    "prep_mxfp4.phase2.first_submit.pre",
+                    L=_layer_idx,
+                    e=cpu_expert_ids[0],
+                )
                 submit_write_expert(cpu_expert_ids[0], 0)
+                _kt_trace("prep_mxfp4.phase2.first_submit.post", L=_layer_idx)
 
+            _kt_trace("prep_mxfp4.phase2.loop.pre", L=_layer_idx, n=len(cpu_expert_ids))
             for idx, e in enumerate(cpu_expert_ids):
                 slot = idx % 2  # Double buffering based on iteration index
 
                 # Sync write for expert e, submit write for next CPU expert
                 if do_write:
+                    _kt_trace("prep_mxfp4.sync_write.pre", L=_layer_idx, idx=idx, e=e)
                     wrapper.sync_write_weight_scale_to_buffer()
+                    _kt_trace("prep_mxfp4.sync_write.post", L=_layer_idx, idx=idx, e=e)
                     if idx + 1 < len(cpu_expert_ids):
                         next_slot = (idx + 1) % 2
                         # Before writing to next_slot, ensure copy from that slot is complete.
                         if idx > 0:
+                            _kt_trace("prep_mxfp4.event_sync.pre", L=_layer_idx, idx=idx, wait_idx=idx - 1)
                             events[idx - 1].synchronize()
+                            _kt_trace("prep_mxfp4.event_sync.post", L=_layer_idx, idx=idx)
+                        _kt_trace(
+                            "prep_mxfp4.submit.pre",
+                            L=_layer_idx,
+                            idx=idx,
+                            next_e=cpu_expert_ids[idx + 1],
+                            next_slot=next_slot,
+                        )
                         submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
+                        _kt_trace("prep_mxfp4.submit.post", L=_layer_idx, idx=idx)
 
                 # Barrier to ensure all ranks see the written data
                 if dist.is_initialized():
+                    _kt_trace("prep_mxfp4.barrier.pre", L=_layer_idx, idx=idx, e=e)
                     dist.barrier(group=get_tp_group().device_group)
+                    _kt_trace("prep_mxfp4.barrier.post", L=_layer_idx, idx=idx, e=e)
 
+                _kt_trace("prep_mxfp4.copy.pre", L=_layer_idx, idx=idx, e=e, slot=slot)
                 with torch.cuda.stream(copy_stream):
                     for _, cpu_buf, gpu_t in weight_infos:
                         gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
                     events[idx].record(copy_stream)
+                _kt_trace("prep_mxfp4.copy.post", L=_layer_idx, idx=idx, e=e)
 
                 # Postprocess expert idx-1: provides pipeline structure for future extensions
                 if idx > 0:
@@ -1150,18 +1250,24 @@ class SharedFullContext:
                         post_stream.wait_event(events[idx - 1])
                         postprocess_expert(idx - 1)
 
+            _kt_trace("prep_mxfp4.phase2.loop.post", L=_layer_idx)
             # Process last CPU expert
             with torch.cuda.stream(post_stream):
                 post_stream.wait_event(events[-1])
                 postprocess_expert(len(cpu_expert_ids) - 1)
 
+            _kt_trace("prep_mxfp4.phase2.wait_stream.pre", L=_layer_idx)
             torch.cuda.current_stream(device).wait_stream(post_stream)
+            _kt_trace("prep_mxfp4.phase2.wait_stream.post", L=_layer_idx)
 
         # --- Phase 3: MXFP4-only layer-level swizzle ---
         # 必须放在 Phase 1+2 stream 同步之后；包装是 metadata-only（StridedLayout
         # no-op + Python wrapper），每次重做完整覆盖 _v4_tk_w13 / _v4_tk_w13_pcg /
         # _v4_tk_w2 / _v4_tk_w2_pcg。Origin: sglang 本身.
+        _kt_trace("prep_mxfp4.phase3.pre", L=_layer_idx)
         self.gpu_method.process_weights_after_loading(self.gpu_layer)
+        _kt_trace("prep_mxfp4.phase3.post", L=_layer_idx)
+        _kt_trace("prep_mxfp4.exit", L=_layer_idx)
 
     def _prepare_weight_fp8_channel(self, wrapper, original_layer=None, gpu_experts_mask=None,
                                      logical_to_gpu_index=None):
@@ -1495,13 +1601,16 @@ class SharedFullContext:
             gpu_experts_mask: bool tensor [num_experts], True = on GPU (optional)
             logical_to_gpu_index: int tensor [num_experts], maps logical ID to GPU index (optional)
         """
+        _kt_trace("ctx_load.entry", L=layer_idx)
         for name, param in self.original_params.items():
             setattr(self.gpu_layer, name, param)
         for name, buf in self.original_buffers.items():
             self.gpu_layer.register_buffer(name, buf)
 
         if torch.cuda.is_available():
+            _kt_trace("ctx_load.sync_pre_prepare.pre", L=layer_idx)
             torch.cuda.synchronize()
+            _kt_trace("ctx_load.sync_pre_prepare.post", L=layer_idx)
 
         tp_rank = get_tensor_model_parallel_rank()
         t0 = time.perf_counter()
@@ -1512,7 +1621,7 @@ class SharedFullContext:
             # V4-Flash MXFP4: byte-copy via FP8 path + re-swizzle into
             # triton_kernels form. Origin: sglang 本身.
             self._prepare_weight_mxfp4(wrapper, original_layer, gpu_experts_mask,
-                                       logical_to_gpu_index)
+                                       logical_to_gpu_index, _layer_idx=layer_idx)
         elif self.is_fp8_quant:
             self._prepare_weight_fp8(wrapper, original_layer, gpu_experts_mask,
                                      logical_to_gpu_index)
@@ -1527,7 +1636,9 @@ class SharedFullContext:
             self._prepare_weight_int4(wrapper)
 
         if torch.cuda.is_available():
+            _kt_trace("ctx_load.sync_post_prepare.pre", L=layer_idx)
             torch.cuda.synchronize()
+            _kt_trace("ctx_load.sync_post_prepare.post", L=layer_idx)
         total_time = (time.perf_counter() - t0) * 1000.0
 
         if tp_rank == 0:
@@ -1536,6 +1647,7 @@ class SharedFullContext:
                 layer_idx,
                 total_time,
             )
+        _kt_trace("ctx_load.exit", L=layer_idx, total_ms=f"{total_time:.1f}")
 
 
 def generate_front_loading_masks(
@@ -2663,17 +2775,32 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             or hasattr(layer, "w13_weight_packed")
             or getattr(layer, "_v4_tk_path", False)
         )
+        _layer_idx_for_trace = getattr(self.kt_config, "layer_idx", "?")
+        _kt_trace(
+            "apply.gate_check",
+            L=_layer_idx_for_trace,
+            n_tok=num_tokens,
+            threshold=self.gpu_prefill_token_threshold,
+            supported=_full_gpu_fallback_supported,
+        )
         if (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
             and _full_gpu_fallback_supported
         ):
+            _kt_trace("apply.gpu_fallback.fired", L=_layer_idx_for_trace, n_tok=num_tokens)
+            _kt_trace("apply.build_full_context.pre", L=_layer_idx_for_trace)
             ctx = self._build_full_context(layer)
+            _kt_trace("apply.build_full_context.post", L=_layer_idx_for_trace)
 
             t_compute = time.perf_counter()
+            _kt_trace("apply.gpu_apply.pre", L=_layer_idx_for_trace)
             result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
+            _kt_trace("apply.gpu_apply.post", L=_layer_idx_for_trace)
             if torch.cuda.is_available():
+                _kt_trace("apply.gpu_apply.sync.pre", L=_layer_idx_for_trace)
                 torch.cuda.synchronize()
+                _kt_trace("apply.gpu_apply.sync.post", L=_layer_idx_for_trace)
             compute_time = (time.perf_counter() - t_compute) * 1000.0
 
             # Dynamic expert update: analyze batch and update GPU experts.
@@ -2710,6 +2837,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         compute_time,
                     )
 
+            _kt_trace("apply.gpu_fallback.return", L=_layer_idx_for_trace, ms=f"{compute_time:.1f}")
             return result
 
         # Step 1: Copy hidden_states to staging buffer and submit CPU computation
