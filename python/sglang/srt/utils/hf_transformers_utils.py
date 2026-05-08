@@ -179,6 +179,27 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+def _peek_is_deepseek_arch(model) -> bool:
+    """Peek the checkpoint's config.json to decide whether to route through the
+    DeepSeek backup-config path. Returns True for DeepSeek-family checkpoints
+    (so the existing config-patching path runs) and False for other models.
+    Fail-open: returns True if the config can't be read, preserving prior behavior."""
+    try:
+        local_path = download_from_hf(str(model))
+        config_file = os.path.join(local_path, "config.json")
+        if not os.path.exists(config_file):
+            return True
+        with open(config_file) as f:
+            cfg = json.load(f)
+        model_type = (cfg.get("model_type") or "").lower()
+        if model_type.startswith("deepseek"):
+            return True
+        archs = cfg.get("architectures") or []
+        return any("deepseek" in str(a).lower() for a in archs)
+    except Exception:
+        return True
+
+
 # Temporary hack for DeepSeek-V3.2 model
 def _load_deepseek_temp_model(
     model_path: str,
@@ -356,7 +377,7 @@ def get_config(
         config = _load_mistral_large_3_for_causal_LM(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-    elif envs.SGLANG_APPLY_CONFIG_BACKUP.get() != "none":
+    elif envs.SGLANG_APPLY_CONFIG_BACKUP.get() != "none" and _peek_is_deepseek_arch(model):
         config = _load_deepseek_temp_model(
             model,
             model_type="deepseek_ref",
