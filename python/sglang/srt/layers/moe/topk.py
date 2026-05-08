@@ -1047,8 +1047,6 @@ def select_experts(
                 topk=num_routed_topk if _use_aiter else top_k,
                 renormalize=renormalize,
                 correction_bias=correction_bias,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
                 scoring_func=scoring_func,
             )
     else:
