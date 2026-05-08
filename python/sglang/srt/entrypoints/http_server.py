@@ -668,14 +668,9 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
-    from sglang.srt._hang_debug import hlog
-    _rid = getattr(obj, "rid", None)
-    _stream = bool(getattr(obj, "stream", False))
-    hlog("HTTP", "generate_enter", rid=_rid, stream=_stream)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
-            hlog("HTTP", "stream_iter_start", rid=_rid)
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
@@ -686,11 +681,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
                 logger.error(f"[http_server] Error: {e}")
-                hlog("HTTP", "stream_error", rid=_rid, err=str(e))
                 yield b"data: " + orjson.dumps(
                     out, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
                 ) + b"\n\n"
-            hlog("HTTP", "stream_iter_done", rid=_rid)
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -700,11 +693,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         )
     else:
         try:
-            hlog("HTTP", "await_first_token", rid=_rid)
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
-            hlog("HTTP", "got_response", rid=_rid)
             return Response(
                 content=orjson.dumps(
                     ret, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
@@ -713,7 +704,6 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             )
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
-            hlog("HTTP", "value_error", rid=_rid, err=str(e))
             return _create_error_response(e)
 
 

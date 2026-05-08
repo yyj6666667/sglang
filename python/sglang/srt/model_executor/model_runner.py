@@ -2431,20 +2431,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        from sglang.srt._hang_debug import hlog
         self.forward_pass_id += 1
-        hlog("FWD", "forward_enter",
-             pass_id=self.forward_pass_id,
-             bs=getattr(forward_batch, "batch_size", -1),
-             mode=str(getattr(forward_batch, "forward_mode", None)),
-             skip_attn=skip_attn_backend_init,
-             split=split_forward_count)
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
         ) as recorder_outputs:
-            hlog("FWD", "forward_raw_pre", pass_id=self.forward_pass_id)
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -2452,8 +2444,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-            hlog("FWD", "forward_raw_post", pass_id=self.forward_pass_id,
-                 can_run_graph=getattr(output, "can_run_graph", None))
             elastic_ep_state = ElasticEPStateManager.instance()
             if (
                 elastic_ep_state is not None

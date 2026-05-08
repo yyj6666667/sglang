@@ -872,6 +872,9 @@ def rmsnorm_self(q: torch.Tensor, eps: float) -> torch.Tensor:
 
 @cache_once
 def _jit_torch_cublas_bf16_fp32() -> Any:
+    import os
+    import tempfile
+
     import torch.utils.cpp_extension
 
     source = """
@@ -919,14 +922,56 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("linear_bf16_fp32", &linear_bf16_fp32, "BF16xBF16 -> FP32 linear (no bias)");
 }
 """
-    module = torch.utils.cpp_extension.load_inline(
-        name="linear_bf16_fp32",
-        cpp_sources="",
-        cuda_sources=source,
-        extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3"],
-        verbose=False,
+    # Stable build dir lets us nuke stale `lock` files left over from a
+    # previously crashed run; without that cleanup, every TP rank that
+    # later hits this path blocks forever inside `file_baton.wait()`.
+    build_dir = os.path.join(
+        os.environ.get(
+            "TORCH_EXTENSIONS_DIR",
+            os.path.join(tempfile.gettempdir(), "torch_extensions"),
+        ),
+        "sglang_linear_bf16_fp32",
     )
+    os.makedirs(build_dir, exist_ok=True)
+
+    try:
+        import torch.distributed as _dist
+
+        is_dist = _dist.is_available() and _dist.is_initialized()
+    except ImportError:
+        is_dist = False
+
+    rank = _dist.get_rank() if is_dist else 0
+
+    if rank == 0:
+        try:
+            os.remove(os.path.join(build_dir, "lock"))
+        except FileNotFoundError:
+            pass
+
+    def _do_load() -> Any:
+        return torch.utils.cpp_extension.load_inline(
+            name="linear_bf16_fp32",
+            cpp_sources="",
+            cuda_sources=source,
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3"],
+            verbose=False,
+            build_directory=build_dir,
+        )
+
+    if not is_dist:
+        return _do_load()
+
+    # Rank 0 compiles alone; other ranks wait on a distributed barrier
+    # rather than racing on the in-process file_baton. After rank 0 is
+    # done, the cache is fully populated and load_inline returns instantly.
+    if rank == 0:
+        module = _do_load()
+        _dist.barrier()
+    else:
+        _dist.barrier()
+        module = _do_load()
     return module
 
 

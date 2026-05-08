@@ -1118,21 +1118,9 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
-        from sglang.srt._hang_debug import hlog, hbeat
-        hlog("LOOP_N", "enter")
-        _iter = 0
         while True:
-            _iter += 1
-            hbeat("loop_n", "LOOP_N", "tick", every_seconds=2.0,
-                  it=_iter,
-                  waiting=len(self.waiting_queue),
-                  running=self.running_batch.batch_size() if self.running_batch is not None else -1,
-                  paused=self._engine_paused,
-                  has_chunked=self.chunked_req is not None)
             # Receive requests
             recv_reqs = self.recv_requests()
-            if recv_reqs:
-                hlog("LOOP_N", "recv_nonempty", n=len(recv_reqs))
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1140,18 +1128,11 @@ class Scheduler(
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-            if batch is not None:
-                hlog("LOOP_N", "got_batch",
-                     bs=batch.batch_size(),
-                     mode=str(getattr(batch, "forward_mode", None)))
 
             # Launch the current batch
             if batch:
-                hlog("LOOP_N", "run_batch_pre", bs=batch.batch_size())
                 result = self.run_batch(batch)
-                hlog("LOOP_N", "run_batch_post")
                 self.process_batch_result(batch, result)
-                hlog("LOOP_N", "process_result_post")
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1164,8 +1145,6 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        from sglang.srt._hang_debug import hlog, hbeat
-        hlog("LOOP_O", "enter")
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -1175,20 +1154,9 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        _iter = 0
         while True:
-            _iter += 1
-            hbeat("loop_o", "LOOP_O", "tick", every_seconds=2.0,
-                  it=_iter,
-                  waiting=len(self.waiting_queue),
-                  running=self.running_batch.batch_size() if self.running_batch is not None else -1,
-                  paused=self._engine_paused,
-                  rq=len(self.result_queue),
-                  has_chunked=self.chunked_req is not None)
             # Receive requests
             recv_reqs = self.recv_requests()
-            if recv_reqs:
-                hlog("LOOP_O", "recv_nonempty", n=len(recv_reqs))
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1196,10 +1164,6 @@ class Scheduler(
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-            if batch is not None:
-                hlog("LOOP_O", "got_batch",
-                     bs=batch.batch_size(),
-                     mode=str(getattr(batch, "forward_mode", None)))
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
             # If we do not need to overlap the current batch with the last batch,
@@ -1265,8 +1229,6 @@ class Scheduler(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-        from sglang.srt._hang_debug import hlog
-
         if self.recv_skipper is not None:
             last_forward_mode = (
                 self.last_batch.forward_mode if self.last_batch is not None else None
@@ -1286,9 +1248,6 @@ class Scheduler(
                         recv_req = unwrap_shm_features(recv_req)
                     except zmq.ZMQError:
                         break
-                    hlog("RECV", "got_from_tokenizer",
-                         rid=getattr(recv_req, "rid", None),
-                         t=type(recv_req).__name__)
                     recv_reqs.append(recv_req)
 
                 while True:
@@ -1405,12 +1364,7 @@ class Scheduler(
         return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
-        from sglang.srt._hang_debug import hlog
-
         for recv_req in recv_reqs:
-            _rid = getattr(recv_req, "rid", None)
-            _ty = type(recv_req).__name__
-            hlog("PROC", "dispatch_pre", rid=_rid, t=_ty)
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None
@@ -1419,11 +1373,9 @@ class Scheduler(
                 or len(self.offload_tags) > 0
             ):
                 self.return_health_check_ct += 1
-                hlog("PROC", "skip_healthcheck", rid=_rid)
                 continue
 
             output = self._request_dispatcher(recv_req)
-            hlog("PROC", "dispatch_post", rid=_rid, has_out=output is not None)
             if output is not None:
                 if not isinstance(output, RpcReqOutput):
                     self.send_to_tokenizer.send_output(output, recv_req)
@@ -1973,11 +1925,6 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-        from sglang.srt._hang_debug import hlog
-        hlog("BATCH", "get_next_enter",
-             waiting=len(self.waiting_queue),
-             running=self.running_batch.batch_size() if self.running_batch is not None else -1,
-             chunked=self.chunked_req is not None)
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
@@ -2409,11 +2356,6 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
-        from sglang.srt._hang_debug import hlog
-        hlog("RUN", "run_batch_enter",
-             bs=batch.batch_size(),
-             mode=str(getattr(batch, "forward_mode", None)),
-             fct=self.forward_ct + 1)
         self.forward_ct += 1
 
         # Whether to run the profiler
