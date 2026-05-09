@@ -1052,218 +1052,265 @@ class SharedFullContext:
 
     def _prepare_weight_mxfp4(self, wrapper, original_layer=None, gpu_experts_mask=None,
                               logical_to_gpu_index=None, _layer_idx="?"):
-        """Prepare V4-Flash MXFP4 weights by writing from KT and copying to GPU.
+        """V4-Flash MXFP4 expert-weight load for the full-GPU prefill fallback.
 
-        Pipeline: write(e+1) || copy(e) || postprocess(e-1)
+        REWRITE — replaces the prior per-expert-NCCL-barrier ring pipeline.
 
-        严格仿照 _prepare_weight_fp8 的 per-expert pipeline 骨架，与其他四个量化
-        方式（fp8 / fp8_channel / bf16 / int4）结构对等。MXFP4 路由专家在 V4-Flash
-        中复用 FP8 block 的 flat 属性名（w13_weight / w13_weight_scale_inv /
-        w2_weight / w2_weight_scale_inv）但 payload 是 FP4 e2m1 nibble-packed
-        + ue8m0 per-kgroup scales。staging-buffer byte-copy 不关心内容语义，
-        与 fp8 路径完全一致。
+        What this function does
+        -----------------------
+        For one MoE layer, populate `self.gpu_layer.{w13_weight,
+        w13_weight_scale_inv, w2_weight, w2_weight_scale_inv}` with all
+        `num_experts` (typically 256) experts and then run the layer-level
+        MXFP4 swizzle so downstream `gpu_method.apply` can find
+        `_v4_tk_w13` / `_v4_tk_w13_pcg` / `_v4_tk_w2` / `_v4_tk_w2_pcg`
+        on `gpu_layer`.
 
-        与 _prepare_weight_fp8 的差异仅在末尾的 Phase 3 layer-level swizzle：
-        把 256 专家 flat tensors 包装成 triton_kernels.Tensor (StridedLayout) 写入
-        gpu_layer._v4_tk_w13 / _v4_tk_w13_pcg / _v4_tk_w2 / _v4_tk_w2_pcg，
-        供下游 gpu_method.apply → apply_v4_triton_kernels_moe 消费。包装本身是
-        metadata-only（无 GPU 存储分配），可每次重做完整覆盖。
+        Phase 1 — GPU-resident experts (no SHM, no collective):
+            For each `e` in `gpu_expert_ids` issue a GPU→GPU copy on the
+            current stream from `original_layer.<name>[gpu_idx]` to
+            `gpu_layer.<name>[e]`. Stream ordering covers visibility to
+            Phase 3.
 
-        Reload-every-call: _SHARED_FULL_CONTEXT 是进程级单例只持一份 gpu_layer，
-        每次 per-layer load() 必须重新覆盖 _v4_tk_* 槽位（它们是纯属性，不在
-        original_params 中，不会被 load() 顶部 restore 清掉）。
+        Phase 2 — CPU-resident experts via KT staging buffer:
+            Producer (rank 0): `wrapper.submit_write_weight_scale_to_buffer`
+            writes one expert's (w13, w13_sf, w2, w2_sf) bytes into all
+            ranks' SHM via `all_rank_buffer_ptrs`, double-buffered across
+            two slots so write(e+1) overlaps with copy(e). `sync_write` is
+            the host wait for the in-flight write to land in SHM.
 
-        本 Phase 3 swizzle 的入口要求外层 model loader 在 threshold > 0 时已
-        跳过 post-swizzle 的 del layer.w13_weight 等（见 mxfp4_deepseek.py）。
+            Consumer (every rank): on `copy_stream`, copy SHM[slot] →
+            `gpu_layer.<name>[e]`, recording an event so the producer can
+            confirm a slot is free before reusing it.
 
-        Origin: sglang 本身 (V4-Flash full-GPU prefill fallback compat).
+            The producer/consumer fence between rank 0's SHM write and
+            every rank's SHM read is a `dist.barrier`. This rewrite does
+            it on the **CPU process group (gloo)**, NOT the device group
+            (NCCL) the prior implementation used. Reasons:
+              * The data being fenced is host shared memory; NCCL has no
+                business in this loop.
+              * NCCL barriers in tight per-expert loops (~10K collectives
+                across 43 layers × 112 CPU experts × 2 prefill chunks)
+                are a known foot-gun: a slight rank skew can corrupt the
+                ring-buffer state and silently wedge the next collective.
+                We saw exactly this — the post-call py-spy showed every
+                rank stuck in the next loop iteration's
+                `recv_requests → broadcast` with no Xid.
+
+        Phase 3 — layer-level MXFP4 swizzle:
+            `gpu_method.process_weights_after_loading(self.gpu_layer)`
+            runs `convert_v4_weights_to_triton_kernels` and stores
+            `_v4_tk_*` on `gpu_layer`. Metadata-only on the Python side
+            (no GPU kernel). Must run after the Phase-2 stream sync.
+
+        Reload-every-call: `_SHARED_FULL_CONTEXT` is a process-level
+        singleton with one `gpu_layer`; every per-layer `load()` call
+        must overwrite the `_v4_tk_*` attributes (they live outside
+        `original_params` and are not restored by `load()`'s top-level
+        restore loop).
+
+        The outer model loader is required to keep the raw flat tensors
+        (`w13_weight` etc.) when `kt_gpu_prefill_token_threshold > 0`;
+        see `mxfp4_deepseek.process_weights_after_loading`.
+
+        Origin: sglang 本身 (V4-Flash full-GPU prefill fallback).
         """
         _kt_trace("prep_mxfp4.entry", L=_layer_idx)
-        # Bind Python thread to specific CPU core (last cores for each rank)
+
         tp_rank = get_tensor_model_parallel_rank()
-        num_cpus = os.cpu_count()
-        target_cpu = num_cpus - 1 - tp_rank
-        os.sched_setaffinity(0, {target_cpu})
+        tp_world_size = get_tensor_model_parallel_world_size()
+
+        # Pin the calling thread to a stable CPU core (last-N per rank) so
+        # KT's host-side write doesn't get bounced across NUMA nodes mid
+        # call. Failure here is non-fatal — we just lose the pinning.
+        try:
+            num_cpus = os.cpu_count() or 1
+            os.sched_setaffinity(0, {max(0, num_cpus - 1 - tp_rank)})
+        except Exception as _e:
+            _kt_trace("prep_mxfp4.affinity_failed", L=_layer_idx, err=str(_e))
 
         layer = self.gpu_layer
         num_experts = layer.num_experts
         device = layer.w13_weight.device
 
-        # Prepare weight tensors (cpu_buf is double-buffered with shape [2, ...])
-        weight_infos = []
-        for name in self.WEIGHT_NAMES_FP8:
-            cpu_buf = self.cpu_buffers[name]  # Shape: [2, ...expert_shape...]
-            gpu_t = getattr(layer, name)  # Shape: [num_experts, ...expert_shape...]
-            weight_infos.append((name, cpu_buf, gpu_t))
+        # (name, cpu_buf [2,...], gpu_t [E,...]) for all four flat tensors.
+        weight_infos = [
+            (name, self.cpu_buffers[name], getattr(layer, name))
+            for name in self.WEIGHT_NAMES_FP8
+        ]
 
-        # Separate GPU experts (direct copy) from CPU experts (KT transfer)
-        gpu_expert_ids = []
-        cpu_expert_ids = []
-        if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
+        # Partition experts by residency (gpu vs cpu).
+        gpu_expert_ids: list[int] = []
+        cpu_expert_ids: list[int] = []
+        if (
+            gpu_experts_mask is not None
+            and original_layer is not None
+            and logical_to_gpu_index is not None
+        ):
             for e in range(num_experts):
                 if gpu_experts_mask[e].item():
                     gpu_expert_ids.append(e)
                 else:
                     cpu_expert_ids.append(e)
         else:
-            # Fallback: all experts from CPU
             cpu_expert_ids = list(range(num_experts))
 
         _kt_trace(
             "prep_mxfp4.split_done",
             L=_layer_idx,
-            n_gpu_experts=len(gpu_expert_ids),
-            n_cpu_experts=len(cpu_expert_ids),
+            n_gpu=len(gpu_expert_ids),
+            n_cpu=len(cpu_expert_ids),
             num_experts=num_experts,
         )
 
-        # --- Phase 1: Copy GPU experts directly (fast GPU-to-GPU) ---
+        # ------------------------------------------------------------------
+        # Phase 1 — GPU-resident experts: direct GPU→GPU copy.
+        # ------------------------------------------------------------------
         _kt_trace("prep_mxfp4.phase1.pre", L=_layer_idx, n=len(gpu_expert_ids))
-        if gpu_expert_ids:
-            for e in gpu_expert_ids:
-                gpu_idx = logical_to_gpu_index[e].item()
-                for name, _, dst in weight_infos:
-                    src = getattr(original_layer, name)  # [num_gpu_experts, ...]
-                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+        for e in gpu_expert_ids:
+            gpu_idx = logical_to_gpu_index[e].item()
+            for name, _, dst in weight_infos:
+                src = getattr(original_layer, name)
+                dst[e].copy_(src[gpu_idx], non_blocking=True)
         _kt_trace("prep_mxfp4.phase1.post", L=_layer_idx)
 
-        # --- Phase 2: Transfer CPU experts via KT pipeline ---
+        # ------------------------------------------------------------------
+        # Phase 2 — CPU-resident experts via the KT staging buffer.
+        # ------------------------------------------------------------------
         if cpu_expert_ids:
-            _kt_trace("prep_mxfp4.phase2.setup_streams", L=_layer_idx)
-            # Pipeline: write(e+1) || copy(e) || postprocess(e-1)
             copy_stream = torch.cuda.Stream(device=device)
-            post_stream = torch.cuda.Stream(device=device)
-            # Events indexed by position in cpu_expert_ids
+            # One CUDA event per CPU expert position. Recorded after the
+            # SHM→GPU copy is enqueued; the producer waits on event[idx-1]
+            # before queuing the next write into the same slot.
             events = [torch.cuda.Event() for _ in range(len(cpu_expert_ids))]
-
-            def postprocess_expert(idx):
-                # MXFP4 swizzle 是 layer-level 操作（PrecisionConfig 持有整张
-                # [E, ...] 的 wrapper），不能拆到 per-expert。占位提供 pipeline
-                # 同步点，与 fp8/bf16 一致。layer-level swizzle 在函数末尾
-                # Phase 3 一次性完成。
-                pass
-
-            # Prepare write pipeline (rank 0 only)
-            tp_world_size = get_tensor_model_parallel_world_size()
             do_write = tp_rank == 0 and wrapper is not None
-            _kt_trace("prep_mxfp4.phase2.do_write", L=_layer_idx, do_write=do_write, world=tp_world_size)
+
+            _kt_trace(
+                "prep_mxfp4.phase2.start",
+                L=_layer_idx, do_write=do_write, world=tp_world_size,
+            )
 
             if do_write:
-                # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
-                w13_weight_buf = self.cpu_buffers["w13_weight"]
-                w13_scale_buf = self.cpu_buffers["w13_weight_scale_inv"]
-                w2_weight_buf = self.cpu_buffers["w2_weight"]
-                w2_scale_buf = self.cpu_buffers["w2_weight_scale_inv"]
+                # Per-expert byte sizes (each cpu_buffer is [2, expert_shape]).
+                buf_nbytes = {
+                    name: (
+                        self.cpu_buffers[name].numel() // 2
+                        * self.cpu_buffers[name].element_size()
+                    )
+                    for name in (
+                        "w13_weight",
+                        "w13_weight_scale_inv",
+                        "w2_weight",
+                        "w2_weight_scale_inv",
+                    )
+                }
 
-                # Buffer shape is [2, ...], so numel() // 2 gives per-expert size
-                w13_weight_expert_nbytes = (
-                    w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
-                )
-                w13_scale_expert_nbytes = (
-                    w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
-                )
-                w2_weight_expert_nbytes = (
-                    w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
-                )
-                w2_scale_expert_nbytes = (
-                    w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
-                )
-
-                def submit_write_expert(expert_id, slot):
-                    # Use provided slot for double buffering
-                    w13_weight_ptrs = [
-                        ptr + slot * w13_weight_expert_nbytes
-                        for ptr in self.all_rank_buffer_ptrs["w13_weight"]
-                    ]
-                    w13_scale_ptrs = [
-                        ptr + slot * w13_scale_expert_nbytes
-                        for ptr in self.all_rank_buffer_ptrs["w13_weight_scale_inv"]
-                    ]
-                    w2_weight_ptrs = [
-                        ptr + slot * w2_weight_expert_nbytes
-                        for ptr in self.all_rank_buffer_ptrs["w2_weight"]
-                    ]
-                    w2_scale_ptrs = [
-                        ptr + slot * w2_scale_expert_nbytes
-                        for ptr in self.all_rank_buffer_ptrs["w2_weight_scale_inv"]
-                    ]
+                def submit_write(expert_id: int, slot: int) -> None:
+                    """Kick KT's async write of one expert into all ranks'
+                    SHM at `slot`. Called only on rank 0."""
+                    ptrs = {
+                        name: [
+                            ptr + slot * buf_nbytes[name]
+                            for ptr in self.all_rank_buffer_ptrs[name]
+                        ]
+                        for name in buf_nbytes
+                    }
                     wrapper.submit_write_weight_scale_to_buffer(
                         tp_world_size,
                         expert_id,
-                        w13_weight_ptrs,
-                        w13_scale_ptrs,
-                        w2_weight_ptrs,
-                        w2_scale_ptrs,
+                        ptrs["w13_weight"],
+                        ptrs["w13_weight_scale_inv"],
+                        ptrs["w2_weight"],
+                        ptrs["w2_weight_scale_inv"],
                     )
 
-                # Submit first CPU expert ahead of time
+                # Prime the pipeline so iter 0 doesn't pay full write
+                # latency before any GPU work is queued.
                 _kt_trace(
-                    "prep_mxfp4.phase2.first_submit.pre",
-                    L=_layer_idx,
-                    e=cpu_expert_ids[0],
+                    "prep_mxfp4.first_submit.pre",
+                    L=_layer_idx, e=cpu_expert_ids[0],
                 )
-                submit_write_expert(cpu_expert_ids[0], 0)
-                _kt_trace("prep_mxfp4.phase2.first_submit.post", L=_layer_idx)
+                submit_write(cpu_expert_ids[0], 0)
+                _kt_trace("prep_mxfp4.first_submit.post", L=_layer_idx)
 
-            _kt_trace("prep_mxfp4.phase2.loop.pre", L=_layer_idx, n=len(cpu_expert_ids))
+            # Producer/consumer handshake group: GLOO, not NCCL.
+            # The fence is purely about host-SHM visibility. Pulling the
+            # GPU communicator into a 100×-per-layer barrier loop is what
+            # poisoned NCCL state in the prior version.
+            cpu_group = (
+                get_tp_group().cpu_group if dist.is_initialized() else None
+            )
+
+            _kt_trace("prep_mxfp4.loop.pre", L=_layer_idx, n=len(cpu_expert_ids))
             for idx, e in enumerate(cpu_expert_ids):
-                slot = idx % 2  # Double buffering based on iteration index
+                slot = idx % 2
 
-                # Sync write for expert e, submit write for next CPU expert
+                # ---- Producer (rank 0) ---------------------------------
                 if do_write:
-                    _kt_trace("prep_mxfp4.sync_write.pre", L=_layer_idx, idx=idx, e=e)
+                    _kt_trace(
+                        "prep_mxfp4.sync_write.pre", L=_layer_idx, idx=idx, e=e,
+                    )
                     wrapper.sync_write_weight_scale_to_buffer()
-                    _kt_trace("prep_mxfp4.sync_write.post", L=_layer_idx, idx=idx, e=e)
+                    _kt_trace(
+                        "prep_mxfp4.sync_write.post", L=_layer_idx, idx=idx, e=e,
+                    )
+
                     if idx + 1 < len(cpu_expert_ids):
                         next_slot = (idx + 1) % 2
-                        # Before writing to next_slot, ensure copy from that slot is complete.
+                        # Reusing `next_slot`: must wait for the GPU copy
+                        # at idx-1 (which used the same slot) to finish
+                        # so we don't overwrite SHM that's still being
+                        # DMA'd to GPU.
                         if idx > 0:
-                            _kt_trace("prep_mxfp4.event_sync.pre", L=_layer_idx, idx=idx, wait_idx=idx - 1)
+                            _kt_trace(
+                                "prep_mxfp4.event_sync.pre",
+                                L=_layer_idx, idx=idx, wait=idx - 1,
+                            )
                             events[idx - 1].synchronize()
-                            _kt_trace("prep_mxfp4.event_sync.post", L=_layer_idx, idx=idx)
+                            _kt_trace(
+                                "prep_mxfp4.event_sync.post",
+                                L=_layer_idx, idx=idx,
+                            )
                         _kt_trace(
                             "prep_mxfp4.submit.pre",
-                            L=_layer_idx,
-                            idx=idx,
-                            next_e=cpu_expert_ids[idx + 1],
-                            next_slot=next_slot,
+                            L=_layer_idx, idx=idx,
+                            next_e=cpu_expert_ids[idx + 1], next_slot=next_slot,
                         )
-                        submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
+                        submit_write(cpu_expert_ids[idx + 1], next_slot)
                         _kt_trace("prep_mxfp4.submit.post", L=_layer_idx, idx=idx)
 
-                # Barrier to ensure all ranks see the written data
-                if dist.is_initialized():
-                    _kt_trace("prep_mxfp4.barrier.pre", L=_layer_idx, idx=idx, e=e)
-                    dist.barrier(group=get_tp_group().device_group)
-                    _kt_trace("prep_mxfp4.barrier.post", L=_layer_idx, idx=idx, e=e)
+                # ---- Consumer fence (gloo) -----------------------------
+                if cpu_group is not None:
+                    _kt_trace(
+                        "prep_mxfp4.barrier.pre", L=_layer_idx, idx=idx, e=e,
+                    )
+                    dist.barrier(group=cpu_group)
+                    _kt_trace(
+                        "prep_mxfp4.barrier.post", L=_layer_idx, idx=idx, e=e,
+                    )
 
-                _kt_trace("prep_mxfp4.copy.pre", L=_layer_idx, idx=idx, e=e, slot=slot)
+                # ---- Consumer copy on copy_stream ----------------------
+                _kt_trace(
+                    "prep_mxfp4.copy.pre",
+                    L=_layer_idx, idx=idx, e=e, slot=slot,
+                )
                 with torch.cuda.stream(copy_stream):
                     for _, cpu_buf, gpu_t in weight_infos:
                         gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
                     events[idx].record(copy_stream)
                 _kt_trace("prep_mxfp4.copy.post", L=_layer_idx, idx=idx, e=e)
 
-                # Postprocess expert idx-1: provides pipeline structure for future extensions
-                if idx > 0:
-                    with torch.cuda.stream(post_stream):
-                        post_stream.wait_event(events[idx - 1])
-                        postprocess_expert(idx - 1)
+            _kt_trace("prep_mxfp4.loop.post", L=_layer_idx)
 
-            _kt_trace("prep_mxfp4.phase2.loop.post", L=_layer_idx)
-            # Process last CPU expert
-            with torch.cuda.stream(post_stream):
-                post_stream.wait_event(events[-1])
-                postprocess_expert(len(cpu_expert_ids) - 1)
+            # Drain copy_stream into the current stream so Phase 3's reads
+            # of `gpu_layer.w*` observe every Phase-2 write.
+            _kt_trace("prep_mxfp4.wait_stream.pre", L=_layer_idx)
+            torch.cuda.current_stream(device).wait_stream(copy_stream)
+            _kt_trace("prep_mxfp4.wait_stream.post", L=_layer_idx)
 
-            _kt_trace("prep_mxfp4.phase2.wait_stream.pre", L=_layer_idx)
-            torch.cuda.current_stream(device).wait_stream(post_stream)
-            _kt_trace("prep_mxfp4.phase2.wait_stream.post", L=_layer_idx)
-
-        # --- Phase 3: MXFP4-only layer-level swizzle ---
-        # 必须放在 Phase 1+2 stream 同步之后；包装是 metadata-only（StridedLayout
-        # no-op + Python wrapper），每次重做完整覆盖 _v4_tk_w13 / _v4_tk_w13_pcg /
-        # _v4_tk_w2 / _v4_tk_w2_pcg。Origin: sglang 本身.
+        # ------------------------------------------------------------------
+        # Phase 3 — layer-level MXFP4 swizzle. Builds _v4_tk_* on
+        # self.gpu_layer. Metadata-only; no GPU kernel.
+        # ------------------------------------------------------------------
         _kt_trace("prep_mxfp4.phase3.pre", L=_layer_idx)
         self.gpu_method.process_weights_after_loading(self.gpu_layer)
         _kt_trace("prep_mxfp4.phase3.post", L=_layer_idx)
