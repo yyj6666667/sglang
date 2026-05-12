@@ -1090,125 +1090,133 @@ class SharedFullContext:
         tp_rank = get_tensor_model_parallel_rank()
         num_cpus = os.cpu_count()
         target_cpu = num_cpus - 1 - tp_rank
+        # Save and restore affinity. This runs in steady state (every prefill
+        # chunk), so leaking the pin would starve hybrid CPU MoE decode of cores
+        # — observed as TP0 spinning at 173% CPU with no decode log, detokenizer
+        # heartbeats stop. Other sched_setaffinity sites in this file only run
+        # at startup and don't have this concern.
+        _saved_aff = os.sched_getaffinity(0)
         os.sched_setaffinity(0, {target_cpu})
+        try:
+            num_experts = self.gpu_layer.num_experts
+            device = buf.w13_weight.device
 
-        num_experts = self.gpu_layer.num_experts
-        device = buf.w13_weight.device
+            weight_infos = [
+                ("w13_weight", self.cpu_buffers["w13_weight"], buf.w13_weight),
+                ("w13_weight_scale_inv", self.cpu_buffers["w13_weight_scale_inv"],
+                 buf.w13_weight_scale_inv),
+                ("w2_weight", self.cpu_buffers["w2_weight"], buf.w2_weight),
+                ("w2_weight_scale_inv", self.cpu_buffers["w2_weight_scale_inv"],
+                 buf.w2_weight_scale_inv),
+            ]
 
-        weight_infos = [
-            ("w13_weight", self.cpu_buffers["w13_weight"], buf.w13_weight),
-            ("w13_weight_scale_inv", self.cpu_buffers["w13_weight_scale_inv"],
-             buf.w13_weight_scale_inv),
-            ("w2_weight", self.cpu_buffers["w2_weight"], buf.w2_weight),
-            ("w2_weight_scale_inv", self.cpu_buffers["w2_weight_scale_inv"],
-             buf.w2_weight_scale_inv),
-        ]
+            gpu_expert_ids = []
+            cpu_expert_ids = []
+            if (gpu_experts_mask is not None and original_layer is not None
+                    and logical_to_gpu_index is not None):
+                for e in range(num_experts):
+                    if gpu_experts_mask[e].item():
+                        gpu_expert_ids.append(e)
+                    else:
+                        cpu_expert_ids.append(e)
+            else:
+                cpu_expert_ids = list(range(num_experts))
 
-        gpu_expert_ids = []
-        cpu_expert_ids = []
-        if (gpu_experts_mask is not None and original_layer is not None
-                and logical_to_gpu_index is not None):
-            for e in range(num_experts):
-                if gpu_experts_mask[e].item():
-                    gpu_expert_ids.append(e)
-                else:
-                    cpu_expert_ids.append(e)
-        else:
-            cpu_expert_ids = list(range(num_experts))
+            # Phase 1: GPU experts — direct GPU→GPU copy
+            if gpu_expert_ids:
+                for e in gpu_expert_ids:
+                    gpu_idx = logical_to_gpu_index[e].item()
+                    for name, _, dst in weight_infos:
+                        src = getattr(original_layer, name)
+                        dst[e].copy_(src[gpu_idx], non_blocking=True)
 
-        # Phase 1: GPU experts — direct GPU→GPU copy
-        if gpu_expert_ids:
-            for e in gpu_expert_ids:
-                gpu_idx = logical_to_gpu_index[e].item()
-                for name, _, dst in weight_infos:
-                    src = getattr(original_layer, name)
-                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+            # Phase 2: CPU experts — write(e+1) || copy(e)
+            if not cpu_expert_ids:
+                # Outer _apply_mxfp4_gpu_prefill step 5 already synchronizes;
+                # extra sync here would block prefetch overlap with compute.
+                self._swizzle_mxfp4_buffer(buf)
+                return
 
-        # Phase 2: CPU experts — write(e+1) || copy(e)
-        if not cpu_expert_ids:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            self._swizzle_mxfp4_buffer(buf)
-            return
+            copy_stream = torch.cuda.Stream(device=device)
+            events = [torch.cuda.Event() for _ in range(len(cpu_expert_ids))]
 
-        copy_stream = torch.cuda.Stream(device=device)
-        events = [torch.cuda.Event() for _ in range(len(cpu_expert_ids))]
-
-        tp_world_size = get_tensor_model_parallel_world_size()
-        do_write = tp_rank == 0 and wrapper is not None
-
-        if do_write:
-            w13_weight_buf = self.cpu_buffers["w13_weight"]
-            w13_scale_buf = self.cpu_buffers["w13_weight_scale_inv"]
-            w2_weight_buf = self.cpu_buffers["w2_weight"]
-            w2_scale_buf = self.cpu_buffers["w2_weight_scale_inv"]
-
-            w13_weight_expert_nbytes = (
-                w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
-            )
-            w13_scale_expert_nbytes = (
-                w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
-            )
-            w2_weight_expert_nbytes = (
-                w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
-            )
-            w2_scale_expert_nbytes = (
-                w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
-            )
-
-            def submit_write_expert(expert_id, slot):
-                w13_weight_ptrs = [
-                    ptr + slot * w13_weight_expert_nbytes
-                    for ptr in self.all_rank_buffer_ptrs["w13_weight"]
-                ]
-                w13_scale_ptrs = [
-                    ptr + slot * w13_scale_expert_nbytes
-                    for ptr in self.all_rank_buffer_ptrs["w13_weight_scale_inv"]
-                ]
-                w2_weight_ptrs = [
-                    ptr + slot * w2_weight_expert_nbytes
-                    for ptr in self.all_rank_buffer_ptrs["w2_weight"]
-                ]
-                w2_scale_ptrs = [
-                    ptr + slot * w2_scale_expert_nbytes
-                    for ptr in self.all_rank_buffer_ptrs["w2_weight_scale_inv"]
-                ]
-                wrapper.submit_write_weight_scale_to_buffer(
-                    tp_world_size,
-                    expert_id,
-                    w13_weight_ptrs,
-                    w13_scale_ptrs,
-                    w2_weight_ptrs,
-                    w2_scale_ptrs,
-                )
-
-            submit_write_expert(cpu_expert_ids[0], 0)
-
-        for idx, e in enumerate(cpu_expert_ids):
-            slot = idx % 2
+            tp_world_size = get_tensor_model_parallel_world_size()
+            do_write = tp_rank == 0 and wrapper is not None
 
             if do_write:
-                wrapper.sync_write_weight_scale_to_buffer()
-                if idx + 1 < len(cpu_expert_ids):
-                    next_slot = (idx + 1) % 2
-                    if idx > 0:
-                        events[idx - 1].synchronize()
-                    submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
+                w13_weight_buf = self.cpu_buffers["w13_weight"]
+                w13_scale_buf = self.cpu_buffers["w13_weight_scale_inv"]
+                w2_weight_buf = self.cpu_buffers["w2_weight"]
+                w2_scale_buf = self.cpu_buffers["w2_weight_scale_inv"]
 
-            if dist.is_initialized():
-                dist.barrier(group=get_tp_group().device_group)
+                w13_weight_expert_nbytes = (
+                    w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+                )
+                w13_scale_expert_nbytes = (
+                    w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+                )
+                w2_weight_expert_nbytes = (
+                    w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+                )
+                w2_scale_expert_nbytes = (
+                    w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+                )
 
-            with torch.cuda.stream(copy_stream):
-                for _, cpu_buf, gpu_t in weight_infos:
-                    gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
-                events[idx].record(copy_stream)
+                def submit_write_expert(expert_id, slot):
+                    w13_weight_ptrs = [
+                        ptr + slot * w13_weight_expert_nbytes
+                        for ptr in self.all_rank_buffer_ptrs["w13_weight"]
+                    ]
+                    w13_scale_ptrs = [
+                        ptr + slot * w13_scale_expert_nbytes
+                        for ptr in self.all_rank_buffer_ptrs["w13_weight_scale_inv"]
+                    ]
+                    w2_weight_ptrs = [
+                        ptr + slot * w2_weight_expert_nbytes
+                        for ptr in self.all_rank_buffer_ptrs["w2_weight"]
+                    ]
+                    w2_scale_ptrs = [
+                        ptr + slot * w2_scale_expert_nbytes
+                        for ptr in self.all_rank_buffer_ptrs["w2_weight_scale_inv"]
+                    ]
+                    wrapper.submit_write_weight_scale_to_buffer(
+                        tp_world_size,
+                        expert_id,
+                        w13_weight_ptrs,
+                        w13_scale_ptrs,
+                        w2_weight_ptrs,
+                        w2_scale_ptrs,
+                    )
 
-        if cpu_expert_ids:
-            torch.cuda.current_stream(device).wait_stream(copy_stream)
+                submit_write_expert(cpu_expert_ids[0], 0)
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        self._swizzle_mxfp4_buffer(buf)
+            for idx, e in enumerate(cpu_expert_ids):
+                slot = idx % 2
+
+                if do_write:
+                    wrapper.sync_write_weight_scale_to_buffer()
+                    if idx + 1 < len(cpu_expert_ids):
+                        next_slot = (idx + 1) % 2
+                        if idx > 0:
+                            events[idx - 1].synchronize()
+                        submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
+
+                if dist.is_initialized():
+                    dist.barrier(group=get_tp_group().device_group)
+
+                with torch.cuda.stream(copy_stream):
+                    for _, cpu_buf, gpu_t in weight_infos:
+                        gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                    events[idx].record(copy_stream)
+
+            if cpu_expert_ids:
+                torch.cuda.current_stream(device).wait_stream(copy_stream)
+
+            # Outer step 5 will torch.cuda.synchronize(). Don't sync here:
+            # it would serialize prefetch behind the compute we want to overlap.
+            self._swizzle_mxfp4_buffer(buf)
+        finally:
+            os.sched_setaffinity(0, _saved_aff)
 
     @staticmethod
     def _swizzle_mxfp4_buffer(buf):
