@@ -108,6 +108,36 @@ class KTConfig:
 
 _SHARED_FULL_CONTEXT = None
 _SHARED_STAGING_BUFFER = None  # Global shared staging buffer for all MoE layers
+_PREFILL_LAYER_REGISTRY = {}  # layer_idx -> KTEPWrapperMethod (for prefetch scheduling)
+_PREFILL_LAYER_ORDER = []     # sorted list of registered MoE layer indices
+
+
+class _MxFp4WeightBuffer:
+    """One buffer in the double-buffered MXFP4 GPU prefill pipeline.
+
+    Holds a complete set of [num_experts, ...] weight tensors on GPU plus
+    the swizzled triton_kernels output produced by convert_v4_weights_to_triton_kernels.
+    Two instances are alternated so that layer N's compute can read from one
+    while layer N+1's load fills the other.
+    """
+    __slots__ = (
+        "w13_weight", "w2_weight", "w13_weight_scale_inv", "w2_weight_scale_inv",
+        "v4_tk_w13", "v4_tk_w13_pcg", "v4_tk_w2", "v4_tk_w2_pcg",
+        "intermediate_size", "num_experts", "ready_layer_idx",
+    )
+
+    def __init__(self, gpu_layer):
+        self.w13_weight = gpu_layer.w13_weight.data.clone()
+        self.w2_weight = gpu_layer.w2_weight.data.clone()
+        self.w13_weight_scale_inv = gpu_layer.w13_weight_scale_inv.data.clone()
+        self.w2_weight_scale_inv = gpu_layer.w2_weight_scale_inv.data.clone()
+        self.v4_tk_w13 = None
+        self.v4_tk_w13_pcg = None
+        self.v4_tk_w2 = None
+        self.v4_tk_w2_pcg = None
+        self.intermediate_size = gpu_layer.w2_weight.shape[2] * 2
+        self.num_experts = gpu_layer.w13_weight.shape[0]
+        self.ready_layer_idx = -1
 
 
 class SharedStagingBuffer:
@@ -185,6 +215,18 @@ class SharedFullContext:
 
         # Create CPU buffers once for weight loading (shared across layers)
         self._create_cpu_buffers()
+
+        # Double-buffered MXFP4 weight storage for layer-to-layer pipelining.
+        # Two _MxFp4WeightBuffer instances allow overlapping layer N's compute
+        # with layer N+1's weight loading.
+        if getattr(self, "is_mxfp4_quant", False):
+            self._mxfp4_bufs = [
+                _MxFp4WeightBuffer(self.gpu_layer),
+                _MxFp4WeightBuffer(self.gpu_layer),
+            ]
+            self._mxfp4_active_buf = 0
+        else:
+            self._mxfp4_bufs = None
 
     def _build_layers(self, layer, init_args, global_num_experts, moe_runner_config):
         from sglang.srt.layers.moe.fused_moe_triton.layer import (
@@ -1029,6 +1071,166 @@ class SharedFullContext:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         self.gpu_method.process_weights_after_loading(self.gpu_layer)
+
+    # ------------------------------------------------------------------
+    # Standalone MXFP4 pipeline for double-buffered layer-to-layer prefill
+    # ------------------------------------------------------------------
+
+    def _load_mxfp4_into(self, buf, wrapper, original_layer=None,
+                         gpu_experts_mask=None, logical_to_gpu_index=None):
+        """Load MXFP4 weights into a _MxFp4WeightBuffer with pipelined copy.
+
+        Standalone 3-stage pipeline (write(e+1) || copy(e)) that writes
+        directly into *buf*'s tensors instead of self.gpu_layer. This
+        allows one buffer to be loaded while the other is read by compute.
+
+        After all experts are filled, applies the triton_kernels swizzle
+        so buf.v4_tk_* are ready for apply_v4_triton_kernels_moe.
+        """
+        tp_rank = get_tensor_model_parallel_rank()
+        num_cpus = os.cpu_count()
+        target_cpu = num_cpus - 1 - tp_rank
+        os.sched_setaffinity(0, {target_cpu})
+
+        num_experts = self.gpu_layer.num_experts
+        device = buf.w13_weight.device
+
+        weight_infos = [
+            ("w13_weight", self.cpu_buffers["w13_weight"], buf.w13_weight),
+            ("w13_weight_scale_inv", self.cpu_buffers["w13_weight_scale_inv"],
+             buf.w13_weight_scale_inv),
+            ("w2_weight", self.cpu_buffers["w2_weight"], buf.w2_weight),
+            ("w2_weight_scale_inv", self.cpu_buffers["w2_weight_scale_inv"],
+             buf.w2_weight_scale_inv),
+        ]
+
+        gpu_expert_ids = []
+        cpu_expert_ids = []
+        if (gpu_experts_mask is not None and original_layer is not None
+                and logical_to_gpu_index is not None):
+            for e in range(num_experts):
+                if gpu_experts_mask[e].item():
+                    gpu_expert_ids.append(e)
+                else:
+                    cpu_expert_ids.append(e)
+        else:
+            cpu_expert_ids = list(range(num_experts))
+
+        # Phase 1: GPU experts — direct GPU→GPU copy
+        if gpu_expert_ids:
+            for e in gpu_expert_ids:
+                gpu_idx = logical_to_gpu_index[e].item()
+                for name, _, dst in weight_infos:
+                    src = getattr(original_layer, name)
+                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+
+        # Phase 2: CPU experts — write(e+1) || copy(e)
+        if not cpu_expert_ids:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._swizzle_mxfp4_buffer(buf)
+            return
+
+        copy_stream = torch.cuda.Stream(device=device)
+        events = [torch.cuda.Event() for _ in range(len(cpu_expert_ids))]
+
+        tp_world_size = get_tensor_model_parallel_world_size()
+        do_write = tp_rank == 0 and wrapper is not None
+
+        if do_write:
+            w13_weight_buf = self.cpu_buffers["w13_weight"]
+            w13_scale_buf = self.cpu_buffers["w13_weight_scale_inv"]
+            w2_weight_buf = self.cpu_buffers["w2_weight"]
+            w2_scale_buf = self.cpu_buffers["w2_weight_scale_inv"]
+
+            w13_weight_expert_nbytes = (
+                w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+            )
+            w13_scale_expert_nbytes = (
+                w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+            )
+            w2_weight_expert_nbytes = (
+                w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+            )
+            w2_scale_expert_nbytes = (
+                w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+            )
+
+            def submit_write_expert(expert_id, slot):
+                w13_weight_ptrs = [
+                    ptr + slot * w13_weight_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w13_weight"]
+                ]
+                w13_scale_ptrs = [
+                    ptr + slot * w13_scale_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w13_weight_scale_inv"]
+                ]
+                w2_weight_ptrs = [
+                    ptr + slot * w2_weight_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w2_weight"]
+                ]
+                w2_scale_ptrs = [
+                    ptr + slot * w2_scale_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w2_weight_scale_inv"]
+                ]
+                wrapper.submit_write_weight_scale_to_buffer(
+                    tp_world_size,
+                    expert_id,
+                    w13_weight_ptrs,
+                    w13_scale_ptrs,
+                    w2_weight_ptrs,
+                    w2_scale_ptrs,
+                )
+
+            submit_write_expert(cpu_expert_ids[0], 0)
+
+        for idx, e in enumerate(cpu_expert_ids):
+            slot = idx % 2
+
+            if do_write:
+                wrapper.sync_write_weight_scale_to_buffer()
+                if idx + 1 < len(cpu_expert_ids):
+                    next_slot = (idx + 1) % 2
+                    if idx > 0:
+                        events[idx - 1].synchronize()
+                    submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
+
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+
+            with torch.cuda.stream(copy_stream):
+                for _, cpu_buf, gpu_t in weight_infos:
+                    gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                events[idx].record(copy_stream)
+
+        if cpu_expert_ids:
+            torch.cuda.current_stream(device).wait_stream(copy_stream)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._swizzle_mxfp4_buffer(buf)
+
+    @staticmethod
+    def _swizzle_mxfp4_buffer(buf):
+        """Convert raw MXFP4 weights in *buf* to triton_kernels layout."""
+        from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
+            convert_v4_weights_to_triton_kernels,
+        )
+        w13_scale = buf.w13_weight_scale_inv.data
+        w2_scale = buf.w2_weight_scale_inv.data
+        if w13_scale.dtype == torch.float32:
+            w13_scale = w13_scale.to(torch.float8_e8m0fnu)
+            w2_scale = w2_scale.to(torch.float8_e8m0fnu)
+        w13_swiz, w13_pcg, w2_swiz, w2_pcg = convert_v4_weights_to_triton_kernels(
+            buf.w13_weight.data, w13_scale,
+            buf.w2_weight.data, w2_scale,
+        )
+        buf.v4_tk_w13 = w13_swiz
+        buf.v4_tk_w13_pcg = w13_pcg
+        buf.v4_tk_w2 = w2_swiz
+        buf.v4_tk_w2_pcg = w2_pcg
+        buf.intermediate_size = buf.w2_weight.shape[2] * 2
+        buf.num_experts = buf.w13_weight.shape[0]
 
     def _prepare_weight_fp8_channel(self, wrapper, original_layer=None, gpu_experts_mask=None,
                                      logical_to_gpu_index=None):
@@ -2540,7 +2742,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             and num_tokens >= self.gpu_prefill_token_threshold
             and _full_gpu_fallback_supported
         ):
-            ctx = self._build_full_context(layer)
+            ctx = self._ensure_full_context(layer)
+
+            # MXFP4 double-buffered pipeline: overlap layer N compute with
+            # layer N+1 weight loading.
+            if ctx._mxfp4_bufs is not None:
+                return self._apply_mxfp4_gpu_prefill(ctx, layer, dispatch_output)
+
+            # Non-MXFP4 path: sequential load → compute
+            ctx.load(
+                layer_idx=self.kt_config.layer_idx,
+                wrapper=self.wrapper,
+                original_layer=layer,
+                gpu_experts_mask=self.gpu_experts_mask,
+                logical_to_gpu_index=self.logical_to_gpu_index,
+            )
 
             t_compute = time.perf_counter()
             result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
@@ -2879,6 +3095,108 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             logical_to_gpu_index=self.logical_to_gpu_index,
         )
         return _SHARED_FULL_CONTEXT
+
+    def _ensure_full_context(self, layer: torch.nn.Module) -> "SharedFullContext":
+        """Create SharedFullContext singleton if needed, without loading weights."""
+        global _SHARED_FULL_CONTEXT
+
+        if _SHARED_FULL_CONTEXT is None:
+            _SHARED_FULL_CONTEXT = SharedFullContext(
+                layer=layer,
+                init_args=self._full_init_args,
+                global_num_experts=self.global_num_experts,
+                moe_runner_config=self.moe_runner_config,
+            )
+        return _SHARED_FULL_CONTEXT
+
+    def _apply_mxfp4_gpu_prefill(self, ctx, layer, dispatch_output):
+        """MXFP4 GPU prefill with double-buffered layer-to-layer pipeline.
+
+        Overlaps layer N's GPU compute with layer N+1's weight loading:
+          1. Use buffer loaded by previous layer (or load synchronously)
+          2. Launch compute on GPU (async)
+          3. Load next layer's weights into other buffer (CPU+DMA, overlaps)
+          4. Synchronize GPU
+        """
+        import bisect
+        layer_idx = self.kt_config.layer_idx
+        tp_rank = self.tp_rank
+
+        # Register this layer for future prefetch by the previous layer.
+        if layer_idx not in _PREFILL_LAYER_REGISTRY:
+            _PREFILL_LAYER_REGISTRY[layer_idx] = (self, layer)
+            _PREFILL_LAYER_ORDER.append(layer_idx)
+            _PREFILL_LAYER_ORDER.sort()
+
+        # Step 1: get loaded buffer or load synchronously
+        t0 = time.perf_counter()
+        buf_idx = ctx._mxfp4_active_buf
+        buf = ctx._mxfp4_bufs[buf_idx]
+
+        if buf.ready_layer_idx == layer_idx:
+            load_ms = 0.0
+        else:
+            ctx._load_mxfp4_into(
+                buf, self.wrapper, layer,
+                self.gpu_experts_mask, self.logical_to_gpu_index,
+            )
+            buf.ready_layer_idx = layer_idx
+            load_ms = (time.perf_counter() - t0) * 1000.0
+
+        # Step 2: point gpu_layer to this buffer's swizzled weights
+        ctx.gpu_layer._v4_tk_w13 = buf.v4_tk_w13
+        ctx.gpu_layer._v4_tk_w13_pcg = buf.v4_tk_w13_pcg
+        ctx.gpu_layer._v4_tk_w2 = buf.v4_tk_w2
+        ctx.gpu_layer._v4_tk_w2_pcg = buf.v4_tk_w2_pcg
+        ctx.gpu_layer._v4_tk_path = True
+        ctx.gpu_layer._v4_tk_intermediate_size = buf.intermediate_size
+        ctx.gpu_layer._v4_tk_num_experts = buf.num_experts
+
+        # Step 3: launch compute (async GPU work)
+        t_compute = time.perf_counter()
+        result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
+
+        # Step 4: load NEXT MoE layer into other buffer, overlapping
+        # with the GPU compute launched in step 3.
+        load_next_ms = 0.0
+        pos = bisect.bisect_right(_PREFILL_LAYER_ORDER, layer_idx)
+        if pos < len(_PREFILL_LAYER_ORDER):
+            next_layer_idx = _PREFILL_LAYER_ORDER[pos]
+            next_entry = _PREFILL_LAYER_REGISTRY.get(next_layer_idx)
+            if next_entry is not None:
+                next_method, next_layer_ref = next_entry
+                next_buf_idx = 1 - buf_idx
+                next_buf = ctx._mxfp4_bufs[next_buf_idx]
+                t_next = time.perf_counter()
+                ctx._load_mxfp4_into(
+                    next_buf, next_method.wrapper, next_layer_ref,
+                    next_method.gpu_experts_mask,
+                    next_method.logical_to_gpu_index,
+                )
+                next_buf.ready_layer_idx = next_layer_idx
+                ctx._mxfp4_active_buf = next_buf_idx
+                load_next_ms = (time.perf_counter() - t_next) * 1000.0
+
+        # Step 5: synchronize GPU compute
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        compute_ms = (time.perf_counter() - t_compute) * 1000.0
+
+        if tp_rank == 0:
+            if load_ms > 0:
+                logger.info(
+                    "KT layerwise prefill: layer %d load = %.2f ms, "
+                    "compute+next_load = %.2f ms (next_load = %.2f ms overlap)",
+                    layer_idx, load_ms, compute_ms, load_next_ms,
+                )
+            else:
+                logger.info(
+                    "KT layerwise prefill: layer %d prefetch hit, "
+                    "compute+next_load = %.2f ms (next_load = %.2f ms overlap)",
+                    layer_idx, compute_ms, load_next_ms,
+                )
+
+        return result
 
 
 # ---------------------------------------------------------------------------
