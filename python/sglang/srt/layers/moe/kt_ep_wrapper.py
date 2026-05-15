@@ -2535,6 +2535,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             or hasattr(layer, "w13_weight_packed")
             or getattr(layer, "_v4_tk_path", False)
         )
+        # DEBUG: print GPU prefill conditions
+        if self.tp_rank == 0 and self.kt_config.layer_idx == 0:
+            logger.info(
+                "[GPU-PREFILL-DEBUG] threshold=%d, num_tokens=%d, _full_gpu_fallback_supported=%s, "
+                "has_w13_weight=%s, has_w13_weight_packed=%s, _v4_tk_path=%s",
+                self.gpu_prefill_token_threshold, num_tokens, _full_gpu_fallback_supported,
+                hasattr(layer, "w13_weight"), hasattr(layer, "w13_weight_packed"),
+                getattr(layer, "_v4_tk_path", False)
+            )
         if (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
