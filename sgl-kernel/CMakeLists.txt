@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
 project(sgl-kernel LANGUAGES CXX CUDA)
 
+# Optional: skip the sm_90 (Hopper) variant of common_ops. Default OFF so
+# the wheel keeps shipping both sm90 + sm100 .pyd. Set to ON to halve build
+# time when targeting a strictly >= sm_100 device (e.g., RTX 5060 sm_120),
+# in which case sgl_kernel/load_utils.py will pick the sm100 .pyd at runtime.
+option(SGL_KERNEL_SKIP_SM90 "Skip the SM90/Hopper variant of common_ops" OFF)
+
 # utils
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 include(FetchContent)
@@ -460,17 +466,19 @@ endif()
 
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
-Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+if(NOT SGL_KERNEL_SKIP_SM90)
+    Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-target_compile_options(common_ops_sm90_build PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
-)
-target_include_directories(common_ops_sm90_build PRIVATE ${INCLUDES})
-# Set output name and separate build directory to avoid conflicts
-set_target_properties(common_ops_sm90_build PROPERTIES
-    OUTPUT_NAME "common_ops"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
-)
+    target_compile_options(common_ops_sm90_build PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
+    )
+    target_include_directories(common_ops_sm90_build PRIVATE ${INCLUDES})
+    # Set output name and separate build directory to avoid conflicts
+    set_target_properties(common_ops_sm90_build PROPERTIES
+        OUTPUT_NAME "common_ops"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
+    )
+endif()
 
 # =========================== Common SM100+ Build ============================= #
 # Build SM100+ library with precise math (same namespace, different directory)
@@ -515,27 +523,35 @@ if(SGL_KERNEL_ENABLE_MSCCLPP)
         ${repo-mscclpp_SOURCE_DIR}
         ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
     )
-    target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+    if(TARGET common_ops_sm90_build)
+        target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+    endif()
     target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 else()
     # mscclpp disabled: common_ops still links torch + CUDA libs, but no
     # mscclpp symbols. The dispatcher in csrc/common_extension.cc guards
     # mscclpp_* registrations with #ifdef SGL_KERNEL_HAS_MSCCLPP.
-    target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+    if(TARGET common_ops_sm90_build)
+        target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+    endif()
     target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 endif()
 
 if(SGL_KERNEL_ENABLE_MSCCLPP)
-    target_compile_definitions(common_ops_sm90_build PRIVATE SGL_KERNEL_HAS_MSCCLPP)
+    if(TARGET common_ops_sm90_build)
+        target_compile_definitions(common_ops_sm90_build PRIVATE SGL_KERNEL_HAS_MSCCLPP)
+    endif()
     target_compile_definitions(common_ops_sm100_build PRIVATE SGL_KERNEL_HAS_MSCCLPP)
 endif()
 
 # sparse flash attention
-target_compile_definitions(common_ops_sm90_build PRIVATE
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    FLASHATTENTION_DISABLE_UNEVEN_K
-)
+if(TARGET common_ops_sm90_build)
+    target_compile_definitions(common_ops_sm90_build PRIVATE
+        FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        FLASHATTENTION_DISABLE_UNEVEN_K
+    )
+endif()
 target_compile_definitions(common_ops_sm100_build PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
@@ -545,7 +561,9 @@ target_compile_definitions(common_ops_sm100_build PRIVATE
 # Install to different subdirectories
 # CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
 # and install them to the specified destinations
-install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
+if(TARGET common_ops_sm90_build)
+    install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
+endif()
 install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
 # ============================ Optional Install: FA3 ============================= #
