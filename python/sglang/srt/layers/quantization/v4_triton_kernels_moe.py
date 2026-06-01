@@ -397,9 +397,9 @@ def _swizzle_mxfp4_strided(quant_tensor: torch.Tensor, scale: torch.Tensor):
     from triton_kernels.tensor_details.layout import StridedLayout
 
     quant_tensor = convert_layout(
-        wrap_torch_tensor(quant_tensor.transpose(-2, -1), dtype=FP4), StridedLayout
+        wrap_torch_tensor(quant_tensor.transpose(-2, -1).contiguous(), dtype=FP4), StridedLayout
     )
-    scale = convert_layout(wrap_torch_tensor(scale.transpose(-2, -1)), StridedLayout)
+    scale = convert_layout(wrap_torch_tensor(scale.transpose(-2, -1).contiguous()), StridedLayout)
     return quant_tensor, InFlexData(), scale
 
 
