@@ -397,9 +397,9 @@ def _swizzle_mxfp4_strided(quant_tensor: torch.Tensor, scale: torch.Tensor):
     from triton_kernels.tensor_details.layout import StridedLayout
 
     quant_tensor = convert_layout(
-        wrap_torch_tensor(quant_tensor.transpose(-2, -1).contiguous(), dtype=FP4), StridedLayout
+        wrap_torch_tensor(quant_tensor.transpose(-2, -1), dtype=FP4), StridedLayout
     )
-    scale = convert_layout(wrap_torch_tensor(scale.transpose(-2, -1).contiguous()), StridedLayout)
+    scale = convert_layout(wrap_torch_tensor(scale.transpose(-2, -1)), StridedLayout)
     return quant_tensor, InFlexData(), scale
 
 
@@ -451,9 +451,17 @@ def convert_v4_weights_to_triton_kernels(
 # Section 6: MoE forward
 # ---------------------------------------------------------------------------
 
-def _extract_raw_tensor(tk_tensor) -> torch.Tensor:
-    """从 triton_kernels.Tensor 提取底层 torch.Tensor."""
-    return tk_tensor.storage.data
+def _extract_raw_tensor_contiguous(tk_tensor, cache_attr: str = "_fp8_contiguous") -> torch.Tensor:
+    """从 triton_kernels.Tensor 提取底层 torch.Tensor，首次做 contiguous 并缓存."""
+    cached = getattr(tk_tensor, cache_attr, None)
+    if cached is not None:
+        return cached
+    t = tk_tensor.storage.data.contiguous()
+    try:
+        setattr(tk_tensor, cache_attr, t)
+    except (AttributeError, TypeError):
+        pass
+    return t
 
 
 def apply_v4_triton_kernels_moe(
@@ -485,10 +493,10 @@ def apply_v4_triton_kernels_moe(
     fp8 = _use_fp8_mma()
 
     if fp8:
-        w13_data = _extract_raw_tensor(w13_swiz)
-        w13_scale_data = _extract_raw_tensor(w13_pcg.weight_scale).view(torch.uint8)
-        w2_data = _extract_raw_tensor(w2_swiz)
-        w2_scale_data = _extract_raw_tensor(w2_pcg.weight_scale).view(torch.uint8)
+        w13_data = _extract_raw_tensor_contiguous(w13_swiz)
+        w13_scale_data = _extract_raw_tensor_contiguous(w13_pcg.weight_scale).view(torch.uint8)
+        w2_data = _extract_raw_tensor_contiguous(w2_swiz)
+        w2_scale_data = _extract_raw_tensor_contiguous(w2_pcg.weight_scale).view(torch.uint8)
 
         intermediate1 = _launch_fp8_gemm(
             hidden_states, w13_data, w13_scale_data,
