@@ -4515,7 +4515,8 @@ class ServerArgs:
             "--kt-method",
             type=str,
             default="AMXINT4",
-            help="[ktransformers parameter] Quantization formats for CPU execution.",
+            help="[ktransformers parameter] Quantization formats for CPU execution. "
+            "Options: AMXINT4, AMXINT8, RAWINT4, FP8, FP8_PERCHANNEL, BF16, MXFP4, MXFP8, GPTQ_INT4, LLAMAFILE",
         )
         parser.add_argument(
             "--kt-cpuinfer",
