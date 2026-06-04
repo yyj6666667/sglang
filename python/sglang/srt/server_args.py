@@ -2234,12 +2234,14 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
-            if self.moe_runner_backend not in ["auto", "cutlass"]:
+            if self.moe_runner_backend not in ["auto", "cutlass", "deep_gemm"]:
                 logger.warning(
                     "mxfp8 quantization forces --moe-runner-backend=cutlass. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
-            self.moe_runner_backend = "cutlass"
+                self.moe_runner_backend = "cutlass"
+            elif self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "cutlass"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [

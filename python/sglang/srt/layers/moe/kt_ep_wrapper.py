@@ -50,7 +50,10 @@ from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda
 
 if is_cuda():
-    from sgl_kernel import gptq_marlin_repack
+    try:
+        from sgl_kernel import gptq_marlin_repack
+    except ImportError:
+        gptq_marlin_repack = None
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -1557,7 +1560,8 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         return _KT_GPU_EXPERTS_MASKS
 
     # Get model config (unwrap VL configs that nest the text model config)
-    hf_config = server_args.get_hf_config()
+    _model_config = server_args.get_model_config()
+    hf_config = getattr(_model_config, "hf_config", _model_config)
 
     # fix for kimi-k2.5 models where text_config holds the actual config
     if getattr(hf_config, "text_config", None) is not None:
@@ -1622,21 +1626,22 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     )
 
     # Determine num_gpu_experts (total across all layers)
-    if server_args.kt_gpu_experts_ratio is not None:
+    _ratio = getattr(server_args, "kt_gpu_experts_ratio", None)
+    if _ratio is not None:
         # Use ratio to calculate total GPU experts
-        num_gpu_experts = int(total_experts * server_args.kt_gpu_experts_ratio)
+        num_gpu_experts = int(total_experts * _ratio)
         if server_args.kt_num_gpu_experts is not None:
             logger.warning(
-                f"--kt-gpu-experts-ratio={server_args.kt_gpu_experts_ratio} is set, "
+                f"--kt-gpu-experts-ratio={_ratio} is set, "
                 f"ignoring --kt-num-gpu-experts={server_args.kt_num_gpu_experts}. "
                 f"Actual total GPU experts: {num_gpu_experts} "
-                f"(= {total_experts} total experts × {server_args.kt_gpu_experts_ratio})"
+                f"(= {total_experts} total experts × {_ratio})"
             )
         else:
             logger.info(
-                f"Using kt_gpu_experts_ratio={server_args.kt_gpu_experts_ratio}, "
+                f"Using kt_gpu_experts_ratio={_ratio}, "
                 f"total GPU experts: {num_gpu_experts} "
-                f"(= {total_experts} total experts × {server_args.kt_gpu_experts_ratio})"
+                f"(= {total_experts} total experts × {_ratio})"
             )
     elif server_args.kt_num_gpu_experts is not None:
         # kt_num_gpu_experts is per-layer, multiply by num_moe_layers
@@ -1651,7 +1656,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         return None
 
     # Get GPU expert placement strategy
-    strategy = server_args.kt_expert_placement_strategy
+    strategy = getattr(server_args, "kt_expert_placement_strategy", "uniform")
 
     # Generate masks based on strategy
     tp_rank = get_tensor_model_parallel_rank()
@@ -1803,10 +1808,12 @@ def create_kt_config_from_server_args(
         KTConfig if KT is configured and not disabled, None otherwise
     """
     # Check if KT EP wrapper is disabled (e.g., for draft models in speculative decoding)
-    from sglang.srt.layers.moe.utils import is_kt_ep_wrapper_disabled
-
-    if is_kt_ep_wrapper_disabled():
-        return None
+    try:
+        from sglang.srt.layers.moe.utils import is_kt_ep_wrapper_disabled
+        if is_kt_ep_wrapper_disabled():
+            return None
+    except ImportError:
+        pass
 
     if server_args.kt_weight_path is None:
         return None
@@ -1817,7 +1824,8 @@ def create_kt_config_from_server_args(
         return None
 
     # Get num_layers from model config (unwrap VL configs)
-    hf_config = server_args.get_hf_config()
+    _model_config2 = server_args.get_model_config()
+    hf_config = getattr(_model_config2, "hf_config", _model_config2)
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
     num_layers = getattr(hf_config, "num_hidden_layers", None)
@@ -1835,14 +1843,14 @@ def create_kt_config_from_server_args(
         gpu_experts_mask=gpu_experts_mask,
         cpuinfer_threads=server_args.kt_cpuinfer,
         threadpool_count=server_args.kt_threadpool_count,
-        numa_nodes=server_args.kt_numa_nodes,
+        numa_nodes=getattr(server_args, "kt_numa_nodes", None),
         weight_path=server_args.kt_weight_path,
         chunked_prefill_size=server_args.chunked_prefill_size,
         method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
-        gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
-        kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
+        gpu_prefill_token_threshold=getattr(server_args, "kt_gpu_prefill_token_threshold", None),
+        kt_enable_dynamic_expert_update=getattr(server_args, "kt_enable_dynamic_expert_update", False),
         swiglu_alpha=getattr(hf_config, "swiglu_alpha", 0.0),
         swiglu_limit=getattr(hf_config, "swiglu_limit", 0.0),
     )
@@ -2230,6 +2238,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             **extra_weight_attrs: Additional weight attributes
         """
         self.global_num_experts = num_experts
+
+        # Save routed-only mask for KTMoEWrapper (CPU side only handles routed experts)
+        self._routed_gpu_experts_mask = self.gpu_experts_mask.clone()
+        self._num_routed_experts = len(self.gpu_experts_mask)
+
+        # Pad gpu_experts_mask if num_experts includes fused shared experts
+        # Shared experts are always on GPU, so pad with True
+        if num_experts > len(self.gpu_experts_mask):
+            pad_size = num_experts - len(self.gpu_experts_mask)
+            self.gpu_experts_mask = torch.cat([
+                self.gpu_experts_mask,
+                torch.ones(pad_size, dtype=torch.bool, device=self.gpu_experts_mask.device),
+            ])
+            self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
+            gpu_expert_indices = torch.where(self.gpu_experts_mask)[0]
+            self.logical_to_gpu_index = torch.full(
+                (len(self.gpu_experts_mask),), -1, dtype=torch.int32
+            )
+            self.logical_to_gpu_index[gpu_expert_indices] = torch.arange(
+                len(gpu_expert_indices), dtype=torch.int32
+            )
+
         self._full_init_args = (
             hidden_size,
             intermediate_size_per_partition,
@@ -2292,15 +2322,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # the DSV4 submode env overrides the model config value (legacy).
             from sglang.srt.environ import envs as _envs
             _kt_swiglu_limit = self.kt_config.swiglu_limit
-            if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" and _kt_swiglu_limit == 0.0:
+            _dsv4_submode = getattr(_envs, "SGLANG_DSV4_2604_SUBMODE", None)
+            if _dsv4_submode is not None and _dsv4_submode.get() == "2604B" and _kt_swiglu_limit == 0.0:
                 _kt_swiglu_limit = 10.0
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
-                num_experts=num_experts,
+                num_experts=self._num_routed_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                gpu_experts_mask=self.gpu_experts_mask,
+                gpu_experts_mask=self._routed_gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 swiglu_limit=_kt_swiglu_limit,
@@ -2492,18 +2523,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Returns:
             Combined computation results from CPU and GPU experts
         """
-        from sglang.srt.eplb.expert_distribution import (
-            get_global_expert_distribution_recorder,
-        )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         # Record GPU expert mask for distribution tracking (rank 0 only)
-        # Use gpu_experts_mask_cuda which is already on GPU for CUDA graph compatibility
         if self.tp_rank == 0:
-            recorder = get_global_expert_distribution_recorder()
-            recorder.on_gpu_expert_mask(
-                self.kt_config.layer_idx, self.gpu_experts_mask_cuda
-            )
+            try:
+                from sglang.srt.eplb.expert_distribution import (
+                    get_global_expert_distribution_recorder,
+                )
+                recorder = get_global_expert_distribution_recorder()
+                if hasattr(recorder, "on_gpu_expert_mask"):
+                    recorder.on_gpu_expert_mask(
+                        self.kt_config.layer_idx, self.gpu_experts_mask_cuda
+                    )
+            except (ImportError, ModuleNotFoundError):
+                pass
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -2679,7 +2713,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # bypass path mirrors that here so the assertion still passes
             # when GPU MoE is short-circuited in favour of CPU experts.
             from sglang.srt.environ import envs as _envs
-            if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+            _dsv4_sub = getattr(_envs, "SGLANG_DSV4_2604_SUBMODE", None)
+            if _dsv4_sub is not None and _dsv4_sub.get() == "2604B":
                 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
                     deepseek_v4_moe_code_path_checker,
                 )
