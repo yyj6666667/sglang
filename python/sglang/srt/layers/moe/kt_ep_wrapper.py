@@ -2477,6 +2477,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
 
+        # Mask out fused shared experts before CPU submission.
+        # KTMoEWrapper only knows routed experts (0..N-1); shared expert IDs
+        # (>= _num_routed_experts) would cause out-of-bounds buffer access.
+        # Set their IDs to 0 (valid but arbitrary) and weights to 0.0 so they
+        # contribute nothing to CPU output.
+        if self._num_routed_experts < self.global_num_experts:
+            shared_mask = topk_ids >= self._num_routed_experts
+            if shared_mask.any():
+                topk_ids = topk_ids.clone()
+                topk_weights = topk_weights.clone()
+                topk_ids[shared_mask] = 0
+                topk_weights[shared_mask] = 0.0
+
         # Submit forward task using staged buffer
         self.wrapper.submit_forward(
             staged_hidden_states,
