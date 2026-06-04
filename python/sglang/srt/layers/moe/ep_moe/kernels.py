@@ -1045,6 +1045,7 @@ def moe_ep_deepgemm_preprocess(
     top_k: int,
     block_shape,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
+    use_mxfp8: bool = False,
 ):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
     seg_indptr = torch.zeros(
@@ -1085,7 +1086,18 @@ def moe_ep_deepgemm_preprocess(
     block_n, block_k = block_shape[0], block_shape[1]
 
     # TODO: fuse this with the preprocess
-    hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+    if use_mxfp8:
+        from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
+        hidden_states, scale = per_token_group_quant_fp8(
+            hidden_states, block_k,
+            column_major_scales=DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=DEEPGEMM_SCALE_UE8M0,
+        )
+        if DEEPGEMM_SCALE_UE8M0:
+            scale = scale.contiguous()
+    else:
+        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
 
     gateup_input_scale = torch.empty(
         (gateup_input.size(0), gateup_input.size(1), scale.size(1)),

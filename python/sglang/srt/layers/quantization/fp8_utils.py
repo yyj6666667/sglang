@@ -49,6 +49,8 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_sm90_supported = is_sm90_supported()
+_is_sm100_supported = is_sm100_supported()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -684,8 +686,8 @@ def triton_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    if not (_is_cuda and is_sm100_supported()):
-        raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100+).")
+    if not (_is_cuda and (_is_sm90_supported or _is_sm100_supported)):
+        raise RuntimeError("MXFP8 dense linear requires SM90+.")
 
     input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -700,14 +702,18 @@ def triton_mxfp8_blockscaled_linear(
     assert k % 128 == 0, f"{k=} must be divisible by 128 for MXFP8"
     assert n % block_n == 0, f"{n=} must be divisible by {block_n}"
     assert weight.dtype == torch.float8_e4m3fn, "MXFP8 weight must be FP8 E4M3."
-    assert weight_scale.dtype == torch.uint8, "MXFP8 weight_scale must be UE8M0 uint8."
+    assert weight_scale.dtype in (torch.uint8, torch.float32), "MXFP8 weight_scale must be UE8M0 uint8 or float32."
+    if weight_scale.dtype == torch.float32:
+        weight_scale = (weight_scale.view(torch.int32) >> 23).to(torch.uint8)
 
     if input_scale is None:
         q_input, x_scale_u8 = mxfp8_group_quantize(input_2d)
     else:
         q_input = input_2d
         x_scale_u8 = input_scale
-        assert x_scale_u8.dtype == torch.uint8, "MXFP8 input_scale must be UE8M0 uint8."
+        assert x_scale_u8.dtype in (torch.uint8, torch.float32), "MXFP8 input_scale must be UE8M0 uint8 or float32."
+        if x_scale_u8.dtype == torch.float32:
+            x_scale_u8 = (x_scale_u8.view(torch.int32) >> 23).to(torch.uint8)
         assert x_scale_u8.shape == (m, k // 32)
 
     if output_dtype is None:

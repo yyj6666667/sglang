@@ -155,7 +155,7 @@ class Fp8Config(QuantizationConfig):
         return [torch.bfloat16, torch.half]
 
     def get_min_capability(self) -> int:
-        return 100 if self.use_mxfp8 else 80
+        return 90 if self.use_mxfp8 else 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -365,7 +365,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     raise ValueError(
                         "MXFP8 requires fp8-serialized checkpoint for linear layers."
                     )
-                scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
+                from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
+                scale_dtype = torch.uint8 if (self.use_mxfp8 and DEEPGEMM_SCALE_UE8M0) else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
                 scale = BlockQuantScaleParameter(
                     data=scale_init(
@@ -869,7 +870,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
         elif self.block_quant:
-            scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
+            from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
+            scale_dtype = torch.uint8 if (self.use_mxfp8 and DEEPGEMM_SCALE_UE8M0) else torch.float32
             scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.ones
             w13_weight_scale = torch.nn.Parameter(
                 scale_init(
@@ -890,8 +892,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             # w13_weight and w2_weight are always requanted together
-            w13_weight_scale.format_ue8m0 = self.use_mxfp8
-            w2_weight_scale.format_ue8m0 = self.use_mxfp8
+            w13_weight_scale.format_ue8m0 = self.use_mxfp8 and DEEPGEMM_SCALE_UE8M0
+            w2_weight_scale.format_ue8m0 = self.use_mxfp8 and DEEPGEMM_SCALE_UE8M0
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
@@ -1096,8 +1098,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
-        if not (_is_cuda and is_sm100_supported()):
-            raise RuntimeError("MXFP8 MoE quantization requires SM100.")
+        if not (_is_cuda and (is_sm100_supported() or is_sm90_supported())):
+            raise RuntimeError("MXFP8 MoE quantization requires SM90+.")
 
         def _quantize_and_swizzle_with_cutlass_es_kernel(weight: torch.Tensor):
             from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
@@ -1226,8 +1228,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight.requires_grad_(False)
         layer.w13_weight_scale_inv.requires_grad_(False)
         layer.w2_weight_scale_inv.requires_grad_(False)
-        layer.w13_weight_scale_inv.format_ue8m0 = True
-        layer.w2_weight_scale_inv.format_ue8m0 = True
+        from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0 as _ue8m0_flag
+        layer.w13_weight_scale_inv.format_ue8m0 = _ue8m0_flag
+        layer.w2_weight_scale_inv.format_ue8m0 = _ue8m0_flag
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
@@ -1580,6 +1583,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
+                use_mxfp8=self.use_mxfp8,
             )
         elif self.runner.runner_backend.is_flashinfer_trtllm():
             # FlashInfer TRT-LLM backend only supports fused execution and consumes

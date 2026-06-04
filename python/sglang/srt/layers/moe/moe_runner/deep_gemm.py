@@ -104,6 +104,32 @@ class DeepGemmRunnerOutput(RunnerOutput):
         return MoeRunnerBackend.DEEP_GEMM
 
 
+def _ensure_float32_scale(scale):
+    if scale.dtype == torch.float32:
+        return scale
+    if scale.dtype == torch.uint8:
+        return (scale.to(torch.int32) << 23).view(torch.float32)
+    if scale.dtype == torch.int32:
+        *batch_dims, last = scale.shape
+        scale_u8 = scale.contiguous().view(torch.uint8).reshape(*batch_dims, last * 4)
+        return (scale_u8.to(torch.int32) << 23).view(torch.float32)
+    return scale.float()
+
+
+def _triton_mxfp8_grouped_gemm_masked(
+    input_fp8, input_scale, weight_fp8, weight_scale,
+    output, masked_m, num_groups, m, block_k
+):
+    from sglang.srt.layers.quantization.grouped_mxfp8_kernel import grouped_mxfp8_block_scaled_matmul
+
+    grouped_mxfp8_block_scaled_matmul(
+        input_fp8, input_scale,
+        weight_fp8, weight_scale,
+        output, masked_m,
+        group_size=block_k,
+    )
+
+
 @dataclass
 class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_weight: torch.Tensor
@@ -112,6 +138,13 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    use_mxfp8: bool = False
+
+    def __post_init__(self):
+        if self.use_mxfp8:
+            assert self.block_shape == [1, 32], (
+                f"MXFP8 requires block_shape [1, 32], got {self.block_shape}"
+            )
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -291,6 +324,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w2_scale = quant_info.w2_scale
 
         hidden_states_device = running_state["hidden_states_device"]
+        use_mxfp8 = quant_info.use_mxfp8
+        scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
 
         # GroupGemm-0
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
@@ -303,6 +338,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     hidden_states_scale
                 )
         else:
+            hidden_states_scale = _ensure_float32_scale(hidden_states_scale)
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
             )
@@ -312,32 +348,37 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (hidden_states, hidden_states_scale),
-            (w13_weight, w13_scale),
-            gateup_output,
-            masked_m,
-            expected_m,
-        )
+        if use_mxfp8 and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
+            _triton_mxfp8_grouped_gemm_masked(
+                hidden_states, hidden_states_scale,
+                w13_weight, w13_scale,
+                gateup_output, masked_m, num_groups, m, scale_block_size
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale),
+                gateup_output,
+                masked_m,
+                expected_m,
+            )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
-        assert is_2604b == (
-            self.swiglu_limit is not None
-        ), f"swiglu_limit must be non-None iff submode=2604B (got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, swiglu_limit={self.swiglu_limit!r})"
         swiglu_limit_arg: Optional[float] = None
-        if is_2604b:
-            assert (
-                not _MASKED_GEMM_FAST_ACT
-            ), "DSV4 2604 submode 2604B does not support SGLANG_MASKED_GEMM_FAST_ACT"
-            assert (
-                envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            ), "DSV4 2604 submode 2604B requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        if self.swiglu_limit is not None:
+            is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
+            if is_2604b:
+                assert (
+                    not _MASKED_GEMM_FAST_ACT
+                ), "DSV4 2604 submode 2604B does not support SGLANG_MASKED_GEMM_FAST_ACT"
+                assert (
+                    envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+                ), "DSV4 2604 submode 2604B requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
 
             if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
                 swiglu_limit_arg = self.swiglu_limit
-            else:
+            elif is_2604b:
                 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
                     deepseek_v4_moe_code_path_checker,
                 )
@@ -357,7 +398,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
             gateup_output,
             masked_m,
-            group_size=128,
+            group_size=scale_block_size,
             topk=self.config.top_k,
             swiglu_limit=swiglu_limit_arg,
             swizzle=self.use_swizzle,
@@ -367,7 +408,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            pass
+        else:
+            down_input_scale = _ensure_float32_scale(down_input_scale)
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
@@ -389,16 +433,24 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (down_input, down_input_scale),
-            (w2_weight, w2_scale),
-            down_output,
-            masked_m,
-            expected_m,
-            **gemm_overlap_args_dict,
-        )
+        if use_mxfp8 and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
+            _triton_mxfp8_grouped_gemm_masked(
+                down_input, down_input_scale,
+                w2_weight, w2_scale,
+                down_output, masked_m, num_groups, m, scale_block_size
+            )
+            deep_gemm_return_value = None
+        else:
+            deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (down_input, down_input_scale),
+                (w2_weight, w2_scale),
+                down_output,
+                masked_m,
+                expected_m,
+                **gemm_overlap_args_dict,
+            )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
-        if meta_overlap_args is not None:
+        if meta_overlap_args is not None and deep_gemm_return_value is not None:
             block_m, threshold = deep_gemm_return_value
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
@@ -440,6 +492,7 @@ def pre_permute_standard_to_deep_gemm(
             hidden_states,
             runner_config.top_k,
             quant_info.block_shape,
+            use_mxfp8=quant_info.use_mxfp8,
         )
     )
 
