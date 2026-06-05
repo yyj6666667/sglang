@@ -261,7 +261,6 @@ class MiniMaxM3MoE(nn.Module):
             gemm1_alpha=config.swiglu_alpha,
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
-            interleaved=False,
         )
         # use sigmoid_topk, instead of grouped_topk
         self.topk = TopK(
