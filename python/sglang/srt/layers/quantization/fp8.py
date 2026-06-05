@@ -155,7 +155,7 @@ class Fp8Config(QuantizationConfig):
         return [torch.bfloat16, torch.half]
 
     def get_min_capability(self) -> int:
-        return 100 if self.use_mxfp8 else 80
+        return 90 if self.use_mxfp8 else 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
