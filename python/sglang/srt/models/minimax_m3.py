@@ -1320,4 +1320,5 @@ def get_spec_layer_idx_from_weight_name(
     return None
 
 
-EntryClass = [MiniMaxM3SparseForCausalLM]
+MiniMaxM3SparseForConditionalGeneration = MiniMaxM3SparseForCausalLM
+EntryClass = [MiniMaxM3SparseForCausalLM, MiniMaxM3SparseForConditionalGeneration]
