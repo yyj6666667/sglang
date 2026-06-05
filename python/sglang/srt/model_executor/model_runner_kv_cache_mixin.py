@@ -9,6 +9,7 @@ from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     is_deepseek_compressed,
     is_deepseek_nsa,
+    is_minimax_sparse,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
@@ -745,6 +746,44 @@ class ModelRunnerKVCacheMixin:
                 layer_num=self.num_effective_layers,
                 device=self.device,
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+            )
+        elif is_minimax_sparse(self.model_config.hf_config):
+            from sglang.srt.configs.model_config import (
+                get_minimax_sparse_attention_config,
+                get_minimax_sparse_disable_value_layer_ids,
+                get_minimax_sparse_layer_ids,
+            )
+            from sglang.srt.mem_cache.pool_registry import resolve_kv_pool_factory
+
+            resolved = resolve_kv_pool_factory(self.model_config, self.server_args)
+            assert resolved is not None, (
+                "is_minimax_sparse() returned True but no KV pool plugin "
+                "is registered — ensure memory_pool.py has been imported."
+            )
+            _, factory = resolved
+            sparse_cfg = get_minimax_sparse_attention_config(
+                self.model_config.hf_config
+            )
+            dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(
+                sparse_cfg
+            )
+            self.token_to_kv_pool = factory(
+                size=self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                head_dim=self.model_config.head_dim,
+                idx_head_dim=sparse_cfg["sparse_index_dim"],
+                dense_layer_ids=dense_layer_ids,
+                sparse_layer_ids=sparse_layer_ids,
+                disable_value_sparse_layer_ids=(
+                    get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
+                ),
+                device=self.device,
+                index_dtype=self.dtype,
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
