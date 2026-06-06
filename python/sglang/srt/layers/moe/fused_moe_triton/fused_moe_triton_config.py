@@ -145,20 +145,10 @@ def get_default_config(
     is_marlin: bool,
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
-    if block_shape is not None and dtype == "fp8_w8a8":
-        # BLOCK_SIZE_K must be <= group_k so each K-tile uses exactly one scale.
-        return {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": block_shape[1],
-            "GROUP_SIZE_M": 8,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
     base_config_item = {
         "BLOCK_SIZE_M": 64,
         "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": 128,
+        "BLOCK_SIZE_K": 128, 
         "GROUP_SIZE_M": 8,
         "num_warps": 4,
         "num_stages": 2

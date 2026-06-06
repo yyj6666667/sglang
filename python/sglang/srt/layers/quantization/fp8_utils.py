@@ -736,9 +736,6 @@ def triton_mxfp8_blockscaled_linear(
     a_scale_packed = _pack_mxfp8_scales(x_scale_u8)
     b_scale_packed = _pack_mxfp8_scales(weight_scale)
 
-    # SM90 (Hopper) Triton dot_scaled + TMA pipeline silently corrupts with num_stages>1.
-    # Only SM100 (Blackwell) supports the multi-stage pipeline.
-    num_stages = 4 if is_sm100_supported() else 1
     output = mxfp8_block_scaled_matmul_triton(
         q_input,
         a_scale_packed,
@@ -748,7 +745,6 @@ def triton_mxfp8_blockscaled_linear(
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
-        num_stages=num_stages,
     )
     output = output[:m, :]
     if bias is not None:
