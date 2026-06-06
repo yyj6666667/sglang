@@ -1096,8 +1096,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
-        if not (_is_cuda and is_sm100_supported()):
-            raise RuntimeError("MXFP8 MoE quantization requires SM100.")
+        if not (_is_cuda and (is_sm100_supported() or is_sm90_supported())):
+            raise RuntimeError("MXFP8 MoE quantization requires SM90+.")
 
         def _quantize_and_swizzle_with_cutlass_es_kernel(weight: torch.Tensor):
             from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
@@ -1182,6 +1182,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             scale = _swizzle_with_triton_kernel(weight.shape, scale)
             return qweight, scale
 
+        def _quantize_no_swizzle(weight: torch.Tensor):
+            weight = weight.contiguous()
+            num_experts, m, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+            weight_flat = weight.view(-1, k).contiguous()
+            qweight, scale = mxfp8_group_quantize(weight_flat)
+            qweight = qweight.view_as(weight)
+            scale = scale.view(num_experts, m, k // 32)
+            return qweight, scale
+
         if quantize:
             if get_moe_runner_backend().is_cutlass():
                 w13_q, w13_s = _quantize_and_swizzle_with_cutlass_es_kernel(
@@ -1190,22 +1200,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_q, w2_s = _quantize_and_swizzle_with_cutlass_es_kernel(
                     layer.w2_weight.data
                 )
-            else:
+            elif is_sm100_supported():
                 w13_q, w13_s = _quantize_and_swizzle_with_triton_kernel(
                     layer.w13_weight.data
                 )
                 w2_q, w2_s = _quantize_and_swizzle_with_triton_kernel(
                     layer.w2_weight.data
                 )
+            else:
+                w13_q, w13_s = _quantize_no_swizzle(layer.w13_weight.data)
+                w2_q, w2_s = _quantize_no_swizzle(layer.w2_weight.data)
         else:
             w13_q = layer.w13_weight.data
             w2_q = layer.w2_weight.data
-            w13_s = _swizzle_with_triton_kernel(
-                layer.w13_weight.data.shape, layer.w13_weight_scale_inv.data
-            )
-            w2_s = _swizzle_with_triton_kernel(
-                layer.w2_weight.data.shape, layer.w2_weight_scale_inv.data
-            )
+            if is_sm100_supported():
+                w13_s = _swizzle_with_triton_kernel(
+                    layer.w13_weight.data.shape, layer.w13_weight_scale_inv.data
+                )
+                w2_s = _swizzle_with_triton_kernel(
+                    layer.w2_weight.data.shape, layer.w2_weight_scale_inv.data
+                )
+            else:
+                w13_s = layer.w13_weight_scale_inv.data
+                w2_s = layer.w2_weight_scale_inv.data
 
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         # Prefer in-place copy; rebind only when shape/dtype changes (online quantize).
@@ -1226,8 +1243,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight.requires_grad_(False)
         layer.w13_weight_scale_inv.requires_grad_(False)
         layer.w2_weight_scale_inv.requires_grad_(False)
-        layer.w13_weight_scale_inv.format_ue8m0 = True
-        layer.w2_weight_scale_inv.format_ue8m0 = True
+        _ue8m0 = is_sm100_supported()
+        layer.w13_weight_scale_inv.format_ue8m0 = _ue8m0
+        layer.w2_weight_scale_inv.format_ue8m0 = _ue8m0
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
