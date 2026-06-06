@@ -2242,10 +2242,8 @@ class ServerArgs:
                     )
                 self.moe_runner_backend = "cutlass"
             else:
-                # SM90 (Hopper/H20): triton fused_moe doesn't integrate cleanly with MXFP8
-                # UE8M0 scales; reference mm-sglang uses flashinfer_trtllm here.
                 if self.moe_runner_backend == "auto":
-                    self.moe_runner_backend = "flashinfer_trtllm"
+                    self.moe_runner_backend = "triton"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
@@ -2264,9 +2262,8 @@ class ServerArgs:
                 "fp8",
                 "modelopt_fp8",
                 "compressed-tensors",
-                "mxfp8",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'compressed-tensors', 'mxfp8', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'compressed-tensors', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
