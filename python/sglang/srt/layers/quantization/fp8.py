@@ -1224,6 +1224,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_s = layer.w13_weight_scale_inv.data
                 w2_s = layer.w2_weight_scale_inv.data
 
+        if not is_sm100_supported():
+            # Triton fused_moe expects float32 scales; convert UE8M0 uint8.
+            # UE8M0 encodes the biased exponent of the scale: float = 2^(val - 127).
+            def _ue8m0_to_float(s: torch.Tensor) -> torch.Tensor:
+                return torch.exp2(s.to(torch.float32) - 127.0)
+
+            w13_s = _ue8m0_to_float(w13_s)
+            w2_s = _ue8m0_to_float(w2_s)
+
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         # Prefer in-place copy; rebind only when shape/dtype changes (online quantize).
         def _copy_or_rebind(param: Parameter, new_value: torch.Tensor) -> None:
