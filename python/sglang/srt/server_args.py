@@ -2234,12 +2234,16 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
-            if self.moe_runner_backend not in ["auto", "cutlass"]:
-                logger.warning(
-                    "mxfp8 quantization forces --moe-runner-backend=cutlass. "
-                    f"Overriding {self.moe_runner_backend!r}."
-                )
-            self.moe_runner_backend = "cutlass"
+            if is_sm100_supported():
+                if self.moe_runner_backend not in ["auto", "cutlass"]:
+                    logger.warning(
+                        "mxfp8 quantization forces --moe-runner-backend=cutlass on SM100. "
+                        f"Overriding {self.moe_runner_backend!r}."
+                    )
+                self.moe_runner_backend = "cutlass"
+            else:
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "triton"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
