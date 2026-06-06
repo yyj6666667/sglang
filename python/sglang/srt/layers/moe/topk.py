@@ -454,6 +454,9 @@ def fused_topk(
     renormalize: bool,
     correction_bias: Optional[torch.Tensor] = None,
     scoring_func: str = "softmax",
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    num_fused_shared_experts: int = 0,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -479,6 +482,8 @@ def fused_topk(
             renormalize,
             correction_bias,
         )
+        if apply_routed_scaling_factor_on_output and routed_scaling_factor is not None:
+            topk_weights.mul_(routed_scaling_factor)
     else:
         raise ValueError(f"Invalid scoring function: {scoring_func}")
 
@@ -1021,7 +1026,6 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
         if scoring_func == "sqrtsoftplus":
             if envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
                 from sglang.srt.layers.moe.deepseek_v4_topk import (
@@ -1051,6 +1055,9 @@ def select_experts(
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                num_fused_shared_experts=num_fused_shared_experts,
             )
     else:
         assert (
