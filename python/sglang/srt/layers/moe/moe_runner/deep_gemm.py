@@ -422,15 +422,44 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 )
                 deepseek_v4_moe_code_path_checker.observed += 1
 
-        # Act
-        down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
-            gateup_output,
-            masked_m,
-            group_size=scale_block_size,
-            topk=self.config.top_k,
-            swiglu_limit=swiglu_limit_arg,
-            swizzle=self.use_swizzle,
-        )
+        # Act. M3 uses swiglu_oai (gate * sigmoid(gate*alpha) * (up + 1),
+        # with clamps) rather than plain silu(gate)*up. The fast
+        # _varlen_deep_gemm_silu_mul_quant kernel has no alpha / (up + 1)
+        # support and overflows fp8 after the first MoE layer or two when
+        # forced down the silu path. Detect the M3-style swiglu_oai by the
+        # presence of gemm1_alpha on the runner config and do the activation
+        # + per-token-group fp8 quant in Python; otherwise use the fast path.
+        gemm1_alpha = getattr(self.config, "gemm1_alpha", None)
+        gemm1_clamp_limit = getattr(self.config, "gemm1_clamp_limit", None)
+        if gemm1_alpha is not None:
+            from sglang.srt.layers.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+
+            gate, up = gateup_output.chunk(2, dim=-1)
+            if gemm1_clamp_limit is not None:
+                gate = gate.clamp(max=gemm1_clamp_limit)
+                up = up.clamp(min=-gemm1_clamp_limit, max=gemm1_clamp_limit)
+            act_out = gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+            num_groups_act, max_m_act, n_act = act_out.shape
+            down_input, down_input_scale = sglang_per_token_group_quant_fp8(
+                act_out.view(num_groups_act * max_m_act, n_act),
+                scale_block_size,
+            )
+            down_input = down_input.view(num_groups_act, max_m_act, n_act)
+            down_input_scale = down_input_scale.view(
+                num_groups_act, max_m_act, -1
+            )
+            del act_out, gate, up
+        else:
+            down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
+                gateup_output,
+                masked_m,
+                group_size=scale_block_size,
+                topk=self.config.top_k,
+                swiglu_limit=swiglu_limit_arg,
+                swizzle=self.use_swizzle,
+            )
         del gateup_output
 
         # GroupGemm-1
