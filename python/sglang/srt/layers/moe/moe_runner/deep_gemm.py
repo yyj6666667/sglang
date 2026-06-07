@@ -353,12 +353,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     hidden_states_scale
                 )
         else:
-            # Hopper / H20: ensure float32 then TMA-align. MXFP8 act scales
-            # are uint8 UE8M0; need float32 before TMA alignment.
+            # Hopper / H20: ensure float32 first. MXFP8 act scales are uint8 UE8M0.
             hidden_states_scale = _ensure_float32_scale(hidden_states_scale)
-            hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
-                hidden_states_scale
-            )
+            if not (use_mxfp8 and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL):
+                # The Triton MXFP8 kernel expects contiguous (E, M, K_groups)
+                # layout; only TMA-align scales when going to deep_gemm.
+                hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                    hidden_states_scale
+                )
 
         num_groups, m, k = hidden_states.shape
         n = w13_weight.size(1)
@@ -436,9 +438,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             down_input_scale = _ensure_float32_scale(down_input_scale)
-            down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
-                down_input_scale
-            )
+            if not (use_mxfp8 and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL):
+                down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                    down_input_scale
+                )
 
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
