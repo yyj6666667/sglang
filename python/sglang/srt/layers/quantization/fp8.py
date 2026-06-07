@@ -1167,9 +1167,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             scale = scale.view(num_experts, aligned_m, k // 32)
             num_warps = 8
             scale = _swizzle_mxfp8_sf(scale, num_warps)
-            # convert_layout may pad for alignment; do NOT view back to the
-            # unpadded shape. Return the swizzled tensor as-is.
-            return scale.data
+            scale = scale.data.view(num_experts, aligned_m, k // 32)
+            return scale
 
         def _quantize_and_swizzle_with_triton_kernel(weight: torch.Tensor):
 
