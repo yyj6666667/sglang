@@ -1193,6 +1193,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            # M3-VL checkpoints prefix every language-model parameter with
+            # "language_model.". Strip it so this loader (which registers
+            # params without that prefix) can find them. Vision encoder
+            # weights would not start with this prefix.
+            if name.startswith("language_model."):
+                name = name[len("language_model.") :]
             layer_id = get_layer_id(name)
             if layer_id is not None and (
                 layer_id < self.model.start_layer or layer_id >= self.model.end_layer
