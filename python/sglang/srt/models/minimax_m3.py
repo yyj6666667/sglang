@@ -1193,17 +1193,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-            # M3-VL checkpoints prefix every language-model parameter with
-            # "language_model.". Strip it so this loader (which registers
-            # params without that prefix) can find them. Vision encoder
-            # weights would not start with this prefix.
-            if name.startswith("language_model."):
-                name = name[len("language_model.") :]
-            # MoE layers are stored under ".block_sparse_moe." on disk but
-            # registered under ".mlp." in the model module tree (see
-            # MiniMaxM3DecoderLayer.__init__).
-            if ".block_sparse_moe." in name:
-                name = name.replace(".block_sparse_moe.", ".mlp.")
             layer_id = get_layer_id(name)
             if layer_id is not None and (
                 layer_id < self.model.start_layer or layer_id >= self.model.end_layer
@@ -1331,7 +1320,60 @@ def get_spec_layer_idx_from_weight_name(
 
 
 class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
-    pass
+    """Lightweight VL wrapper for M3 sparse.
+
+    The on-disk M3-preview checkpoint is a vision-language model:
+    ``config.architectures = ["MiniMaxM3SparseForConditionalGeneration"]``
+    with every LM-related field nested under ``config.text_config`` and
+    every LM weight prefixed with ``language_model.`` on disk. Vision
+    components additionally live under ``vision_tower.*`` /
+    ``multi_modal_projector.*`` / ``patch_merge_mlp.*``.
+
+    For text-only inference we do not instantiate the vision tower —
+    this subclass only:
+
+    * unwraps ``text_config`` so :class:`MiniMaxM3SparseForCausalLM`'s
+      ``__init__`` sees a flat config (hidden_size, vocab_size,
+      sparse_attention_config, ...) where it expects them.
+    * filters the checkpoint stream: silently skip vision weights;
+      strip the ``language_model.`` prefix; remap the older M2-style
+      ``block_sparse_moe.*`` naming to ``mlp.*`` (the in-tree module
+      name used by :class:`MiniMaxM3DecoderLayer`).
+
+    Mirrors the dispatch that mm-sglang-triton-h20's standalone
+    ``minimax_m3_vl.py`` performs in its ``load_weights``, minus the
+    actual vision tower construction.
+    """
+
+    _VISION_PREFIXES = (
+        "vision_tower.",
+        "multi_modal_projector.",
+        "patch_merge_mlp.",
+    )
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        text_config = getattr(config, "text_config", config)
+        super().__init__(text_config, quant_config, prefix)
+        # Keep the full VL config in case downstream code introspects it.
+        self._vl_config = config
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def _filtered():
+            for name, weight in weights:
+                if any(name.startswith(p) for p in self._VISION_PREFIXES):
+                    continue
+                if name.startswith("language_model."):
+                    name = name[len("language_model.") :]
+                if ".block_sparse_moe." in name:
+                    name = name.replace(".block_sparse_moe.", ".mlp.")
+                yield name, weight
+
+        return super().load_weights(_filtered())
 
 
 EntryClass = [MiniMaxM3SparseForCausalLM, MiniMaxM3SparseForConditionalGeneration]
