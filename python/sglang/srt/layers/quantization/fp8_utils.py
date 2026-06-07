@@ -684,6 +684,14 @@ def triton_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
+    from sglang.srt.debug_utils.m3_hidden_dump import enabled as _dump_on
+    from sglang.srt.debug_utils.m3_hidden_dump import record as _dump
+
+    if _dump_on():
+        _dump("mxfp8_linear.in.x", input)
+        _dump("mxfp8_linear.in.w", weight)
+        _dump("mxfp8_linear.in.w_scale", weight_scale)
+
     if not (_is_cuda and (is_sm100_supported() or is_sm90_supported())):
         raise RuntimeError("MXFP8 dense linear requires SM90+.")
 
@@ -753,7 +761,10 @@ def triton_mxfp8_blockscaled_linear(
     output = output[:m, :]
     if bias is not None:
         output += bias
-    return output.to(dtype=output_dtype).view(*output_shape)
+    result = output.to(dtype=output_dtype).view(*output_shape)
+    if _dump_on():
+        _dump("mxfp8_linear.out", result)
+    return result
 
 
 def dequant_mxfp4(

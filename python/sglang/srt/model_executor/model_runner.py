@@ -1107,6 +1107,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.pp_rank,
             )
 
+        # debug branch: stats-only hidden-states dump, env-gated.
+        if os.environ.get("M3_DEBUG_DUMP") == "1":
+            from sglang.srt.debug_utils.m3_hidden_dump import register_all_hooks
+
+            register_all_hooks(self.model, tp_rank=self.tp_rank)
+
         if dumper.may_enable:
             dumper.register_non_intrusive_dumper(self.model)
 

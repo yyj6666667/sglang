@@ -325,6 +325,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.debug_utils.m3_hidden_dump import enabled as _dump_on
+        from sglang.srt.debug_utils.m3_hidden_dump import record as _dump
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -333,6 +335,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         w13_weight = quant_info.w13_weight
         w2_weight = quant_info.w2_weight
+
+        if _dump_on():
+            _layer_idx = running_state.get("layer_idx", "?")
+            _dump("masked_gemm.in.hidden", hidden_states, layer_idx=_layer_idx)
+            _dump("masked_gemm.in.h_scale", hidden_states_scale, layer_idx=_layer_idx)
+            _dump("masked_gemm.in.w13", w13_weight, layer_idx=_layer_idx)
+            _dump("masked_gemm.in.w13_scale", quant_info.w13_scale, layer_idx=_layer_idx)
+            _dump("masked_gemm.in.w2", w2_weight, layer_idx=_layer_idx)
+            _dump("masked_gemm.in.w2_scale", quant_info.w2_scale, layer_idx=_layer_idx)
         w13_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
 
@@ -388,6 +399,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 masked_m,
                 expected_m,
             )
+        if _dump_on():
+            _dump("masked_gemm.out.gateup", gateup_output, layer_idx=_layer_idx)
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -431,6 +444,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             swiglu_limit=swiglu_limit_arg,
             swizzle=self.use_swizzle,
         )
+        if _dump_on():
+            _dump("masked_gemm.act.down_input", down_input, layer_idx=_layer_idx)
+            _dump(
+                "masked_gemm.act.down_input_scale", down_input_scale, layer_idx=_layer_idx
+            )
         del gateup_output
 
         # GroupGemm-1
@@ -487,6 +505,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             block_m, threshold = deep_gemm_return_value
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
+
+        if _dump_on():
+            _dump("masked_gemm.out.down", down_output, layer_idx=_layer_idx)
 
         return down_output
 

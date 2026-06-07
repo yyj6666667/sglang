@@ -146,6 +146,15 @@ def grouped_mxfp8_block_scaled_matmul(
     block_n: int = 64,
     block_k: int = 64,
 ) -> None:
+    from sglang.srt.debug_utils.m3_hidden_dump import enabled as _dump_on
+    from sglang.srt.debug_utils.m3_hidden_dump import record as _dump
+
+    if _dump_on():
+        _dump("grouped_mxfp8.in.a", a)
+        _dump("grouped_mxfp8.in.a_scale", a_scale)
+        _dump("grouped_mxfp8.in.b", b)
+        _dump("grouped_mxfp8.in.b_scale", b_scale)
+        _dump("grouped_mxfp8.in.masked_m", masked_m)
     """Fused grouped MXFP8 GEMM for MoE.
 
     Args:
@@ -204,3 +213,6 @@ def grouped_mxfp8_block_scaled_matmul(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
     )
+
+    if _dump_on():
+        _dump("grouped_mxfp8.out.output", output)
