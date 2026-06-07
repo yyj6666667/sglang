@@ -2282,18 +2282,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
         if self.tp_rank == 0:
-            # V4-Flash 2604B SwiGLU clamp on routed experts. The full
-            # moe_runner_config (which carries swiglu_limit) does not arrive
-            # until create_moe_runner(), but the value is fully determined
-            # by the DSV4 submode env (fixed at process start), so we read
-            # it here without waiting. Matches the assert
-            # `swiglu_limit == 10` in moe_runner/deep_gemm.py:_apply_swiglu_limit
-            # and the default 10.0 set for 2604B in mxfp4_deepseek.py.
-            # Origin: kt-sglang 耦合 (carries V4-2604B limit into kt-kernel).
+            # SwiGLU activation params for CPU experts. Source of truth is
+            # MoeRunnerConfig.gemm1_alpha / gemm1_clamp_limit, which the
+            # model file populates from its own config (e.g. minimax_m3.py
+            # passes config.swiglu_alpha / config.swiglu_limit). The DSV4
+            # 2604B env switch is kept as a fallback for legacy callers
+            # that never set the config fields. Without this read, M3
+            # hybrid passes alpha=0/limit=0 to kt-kernel — C++ act_fn
+            # silently picks the plain-silu branch while GPU runs
+            # swigluoai, producing garbled output (120/128 experts wrong).
             from sglang.srt.environ import envs as _envs
-            _kt_swiglu_limit = (
-                10.0 if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" else 0.0
-            )
+            _mrc = getattr(layer, "moe_runner_config", None)
+            _cfg_alpha = getattr(_mrc, "gemm1_alpha", None) if _mrc is not None else None
+            _cfg_limit = getattr(_mrc, "gemm1_clamp_limit", None) if _mrc is not None else None
+            _kt_swiglu_alpha = float(_cfg_alpha) if _cfg_alpha is not None else 0.0
+            _kt_swiglu_limit = float(_cfg_limit) if _cfg_limit is not None else 0.0
+            if _kt_swiglu_limit == 0.0 and _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+                _kt_swiglu_limit = 10.0
+            # M3-PROBE-1: verify alpha/limit reach the KTMoEWrapper() call.
+            # Remove after the M3 CPU/GPU hybrid path is confirmed coherent.
+            if self.kt_config.layer_idx == 4:
+                print(
+                    f"[M3-PROBE-1] layer_idx={self.kt_config.layer_idx} "
+                    f"gemm1_alpha={_cfg_alpha!r} gemm1_clamp_limit={_cfg_limit!r} "
+                    f"-> swiglu_alpha={_kt_swiglu_alpha!r} swiglu_limit={_kt_swiglu_limit!r} "
+                    f"method={self.kt_config.method!r}",
+                    flush=True,
+                )
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
@@ -2304,6 +2319,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 swiglu_limit=_kt_swiglu_limit,
+                swiglu_alpha=_kt_swiglu_alpha,
                 numa_nodes=self.kt_config.numa_nodes,
                 weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
