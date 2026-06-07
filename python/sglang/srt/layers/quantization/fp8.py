@@ -1192,6 +1192,48 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             scale = scale.view(num_experts, m, k // 32)
             return qweight, scale
 
+        # ---- deep_gemm path (ported from mm-sglang-triton-h20). ----
+        # On H20 / SM90, DEEPGEMM_SCALE_UE8M0 is False, so the packer returns
+        # raw float32 scales; the deep_gemm runner then TMA-aligns them.
+        def _ue8m0_to_float32(scale_u8: torch.Tensor) -> torch.Tensor:
+            """UE8M0 uint8 (biased exponent) -> float32 via bit shift."""
+            return (scale_u8.to(torch.int32) << 23).view(torch.float32)
+
+        def _pack_moe_scale_for_deepgemm(scale_fp32: torch.Tensor) -> torch.Tensor:
+            from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+                DEEPGEMM_SCALE_UE8M0,
+            )
+
+            if DEEPGEMM_SCALE_UE8M0:
+                import deep_gemm.utils.layout
+
+                return deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                    scale_fp32
+                )
+            return scale_fp32
+
+        def _convert_ue8m0_scales_for_deepgemm(
+            scale_u8: torch.Tensor, shape: tuple
+        ) -> torch.Tensor:
+            num_experts, m = shape[0], shape[1]
+            k_groups = scale_u8.shape[-1]
+            scale_fp32 = _ue8m0_to_float32(scale_u8.contiguous().view(-1)).view(
+                num_experts, m, k_groups
+            )
+            return _pack_moe_scale_for_deepgemm(scale_fp32)
+
+        def _quantize_for_deepgemm(weight: torch.Tensor):
+            weight = weight.contiguous()
+            num_experts, m, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+            weight_flat = weight.view(-1, k).contiguous()
+            qweight, scale_u8 = mxfp8_group_quantize(weight_flat)
+            qweight = qweight.view_as(weight)
+            scale_fp32 = _ue8m0_to_float32(scale_u8).view(num_experts, m, k // 32)
+            return qweight, _pack_moe_scale_for_deepgemm(scale_fp32)
+
+        is_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+
         if quantize:
             if get_moe_runner_backend().is_cutlass():
                 w13_q, w13_s = _quantize_and_swizzle_with_cutlass_es_kernel(
@@ -1200,6 +1242,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_q, w2_s = _quantize_and_swizzle_with_cutlass_es_kernel(
                     layer.w2_weight.data
                 )
+            elif is_deep_gemm:
+                w13_q, w13_s = _quantize_for_deepgemm(layer.w13_weight.data)
+                w2_q, w2_s = _quantize_for_deepgemm(layer.w2_weight.data)
             elif is_sm100_supported():
                 w13_q, w13_s = _quantize_and_swizzle_with_triton_kernel(
                     layer.w13_weight.data
@@ -1213,7 +1258,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             w13_q = layer.w13_weight.data
             w2_q = layer.w2_weight.data
-            if is_sm100_supported():
+            if is_deep_gemm:
+                w13_s = _convert_ue8m0_scales_for_deepgemm(
+                    layer.w13_weight_scale_inv.data, layer.w13_weight.data.shape
+                )
+                w2_s = _convert_ue8m0_scales_for_deepgemm(
+                    layer.w2_weight_scale_inv.data, layer.w2_weight.data.shape
+                )
+            elif is_sm100_supported():
                 w13_s = _swizzle_with_triton_kernel(
                     layer.w13_weight.data.shape, layer.w13_weight_scale_inv.data
                 )
@@ -1224,9 +1276,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_s = layer.w13_weight_scale_inv.data
                 w2_s = layer.w2_weight_scale_inv.data
 
-        if not is_sm100_supported():
-            # Triton fused_moe expects float32 scales; convert UE8M0 uint8.
-            # UE8M0 encodes the biased exponent of the scale: float = 2^(val - 127).
+        if not is_sm100_supported() and not is_deep_gemm:
+            # Triton fused_moe (legacy path) expects float32 scales; convert
+            # UE8M0 uint8: float = 2^(val - 127). The deep_gemm path already
+            # produced float32 (or int32-packed on Blackwell), so skip it.
             def _ue8m0_to_float(s: torch.Tensor) -> torch.Tensor:
                 return torch.exp2(s.to(torch.float32) - 127.0)
 
