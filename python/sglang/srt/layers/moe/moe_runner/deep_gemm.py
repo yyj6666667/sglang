@@ -104,6 +104,50 @@ class DeepGemmRunnerOutput(RunnerOutput):
         return MoeRunnerBackend.DEEP_GEMM
 
 
+def _ensure_float32_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Convert UE8M0 scale to float32 for Hopper TMA align.
+
+    Handles uint8 (raw UE8M0) and int32 (4x uint8 packed) layouts.
+    """
+    if scale.dtype == torch.float32:
+        return scale
+    if scale.dtype == torch.uint8:
+        return (scale.to(torch.int32) << 23).view(torch.float32)
+    if scale.dtype == torch.int32:
+        # Packed UE8M0: 4 uint8 values per int32. Unpack then convert.
+        *batch_dims, last = scale.shape
+        scale_u8 = scale.contiguous().view(torch.uint8).reshape(*batch_dims, last * 4)
+        return (scale_u8.to(torch.int32) << 23).view(torch.float32)
+    raise TypeError(f"Unexpected scale dtype: {scale.dtype}")
+
+
+def _triton_mxfp8_grouped_gemm_masked(
+    input_fp8: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight_fp8: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+    num_groups: int,
+    m: int,
+    block_k: int,
+) -> None:
+    """Hopper MXFP8 grouped GEMM via Triton (deep_gemm masked has no MXFP8 path)."""
+    from sglang.srt.layers.quantization.grouped_mxfp8_kernel import (
+        grouped_mxfp8_block_scaled_matmul,
+    )
+
+    grouped_mxfp8_block_scaled_matmul(
+        input_fp8,
+        input_scale,
+        weight_fp8,
+        weight_scale,
+        output,
+        masked_m,
+        group_size=block_k,
+    )
+
+
 @dataclass
 class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_weight: torch.Tensor
@@ -112,6 +156,8 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    # When True, route masked GEMMs through the Triton MXFP8 kernel on Hopper.
+    use_mxfp8: bool = False
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -291,6 +337,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w2_scale = quant_info.w2_scale
 
         hidden_states_device = running_state["hidden_states_device"]
+        use_mxfp8 = quant_info.use_mxfp8
+        scale_block_size = (
+            quant_info.block_shape[1] if quant_info.block_shape else 128
+        )
 
         # GroupGemm-0
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
@@ -303,6 +353,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     hidden_states_scale
                 )
         else:
+            # Hopper / H20: ensure float32 then TMA-align. MXFP8 act scales
+            # are uint8 UE8M0; need float32 before TMA alignment.
+            hidden_states_scale = _ensure_float32_scale(hidden_states_scale)
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
             )
@@ -312,13 +365,27 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (hidden_states, hidden_states_scale),
-            (w13_weight, w13_scale),
-            gateup_output,
-            masked_m,
-            expected_m,
-        )
+        if use_mxfp8 and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
+            # Hopper MXFP8 fallback: deep_gemm masked has no recipe knob.
+            _triton_mxfp8_grouped_gemm_masked(
+                hidden_states,
+                hidden_states_scale,
+                w13_weight,
+                w13_scale,
+                gateup_output,
+                masked_m,
+                num_groups,
+                m,
+                scale_block_size,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale),
+                gateup_output,
+                masked_m,
+                expected_m,
+            )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -357,7 +424,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
             gateup_output,
             masked_m,
-            group_size=128,
+            group_size=scale_block_size,
             topk=self.config.top_k,
             swiglu_limit=swiglu_limit_arg,
             swizzle=self.use_swizzle,
@@ -368,6 +435,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         n = w2_weight.shape[1]
 
         if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            down_input_scale = _ensure_float32_scale(down_input_scale)
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
@@ -389,16 +457,30 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (down_input, down_input_scale),
-            (w2_weight, w2_scale),
-            down_output,
-            masked_m,
-            expected_m,
-            **gemm_overlap_args_dict,
-        )
+        if use_mxfp8 and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
+            _triton_mxfp8_grouped_gemm_masked(
+                down_input,
+                down_input_scale,
+                w2_weight,
+                w2_scale,
+                down_output,
+                masked_m,
+                num_groups,
+                m,
+                scale_block_size,
+            )
+            deep_gemm_return_value = None
+        else:
+            deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (down_input, down_input_scale),
+                (w2_weight, w2_scale),
+                down_output,
+                masked_m,
+                expected_m,
+                **gemm_overlap_args_dict,
+            )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
-        if meta_overlap_args is not None:
+        if meta_overlap_args is not None and deep_gemm_return_value is not None:
             block_m, threshold = deep_gemm_return_value
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold

@@ -1660,6 +1660,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
+                use_mxfp8=getattr(self, "use_mxfp8", False),
             )
         elif self.runner.runner_backend.is_flashinfer_trtllm():
             # FlashInfer TRT-LLM backend only supports fused execution and consumes
