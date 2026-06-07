@@ -1199,6 +1199,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             # weights would not start with this prefix.
             if name.startswith("language_model."):
                 name = name[len("language_model.") :]
+            # MoE layers are stored under ".block_sparse_moe." on disk but
+            # registered under ".mlp." in the model module tree (see
+            # MiniMaxM3DecoderLayer.__init__).
+            if ".block_sparse_moe." in name:
+                name = name.replace(".block_sparse_moe.", ".mlp.")
             layer_id = get_layer_id(name)
             if layer_id is not None and (
                 layer_id < self.model.start_layer or layer_id >= self.model.end_layer
