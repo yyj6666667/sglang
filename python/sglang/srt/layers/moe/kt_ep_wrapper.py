@@ -2558,8 +2558,39 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         ):
             ctx = self._build_full_context(layer)
 
+            try:
+                from sglang.srt.debug_utils.m3_dump_v2 import dump as _m3d
+            except Exception:
+                _m3d = None
+            _lid = getattr(self.kt_config, "layer_idx", -1)
+            if _m3d:
+                _m3d("EP_in_hs", dispatch_output.hidden_states, layer=_lid,
+                     dispatch_type=type(dispatch_output).__name__)
+                _hss = getattr(dispatch_output, "hidden_states_scale", None)
+                if _hss is not None:
+                    _m3d("EP_in_hs_scale", _hss, layer=_lid)
+                _tk = getattr(dispatch_output, "topk_output", None)
+                if _tk is not None:
+                    _ids = getattr(_tk, "topk_ids", None)
+                    _ws = getattr(_tk, "topk_weights", None)
+                    if _ids is not None:
+                        _m3d("EP_in_topk_ids", _ids, layer=_lid)
+                    if _ws is not None:
+                        _m3d("EP_in_topk_weights", _ws, layer=_lid)
+                _m3d("EP_gpu_w13", ctx.gpu_layer.w13_weight, layer=_lid)
+                _m3d("EP_gpu_w2", ctx.gpu_layer.w2_weight, layer=_lid)
+                _gw13s = getattr(ctx.gpu_layer, "w13_scale", None)
+                if _gw13s is not None:
+                    _m3d("EP_gpu_w13_scale", _gw13s, layer=_lid)
+                _gw2s = getattr(ctx.gpu_layer, "w2_scale", None)
+                if _gw2s is not None:
+                    _m3d("EP_gpu_w2_scale", _gw2s, layer=_lid)
+
             t_compute = time.perf_counter()
             result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
+            if _m3d:
+                _result_hs = result.hidden_states if hasattr(result, "hidden_states") else result
+                _m3d("EP_out_hs", _result_hs, layer=_lid)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             compute_time = (time.perf_counter() - t_compute) * 1000.0
@@ -2691,8 +2722,31 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 )
                 deepseek_v4_moe_code_path_checker.observed += 1
         else:
+            try:
+                from sglang.srt.debug_utils.m3_dump_v2 import dump as _m3d_h
+            except Exception:
+                _m3d_h = None
+            _lid_h = getattr(self.kt_config, "layer_idx", -1)
+            if _m3d_h:
+                _m3d_h("HYB_in_hs", masked_dispatch_output.hidden_states, layer=_lid_h,
+                       dispatch_type=type(masked_dispatch_output).__name__)
+                _hssh = getattr(masked_dispatch_output, "hidden_states_scale", None)
+                if _hssh is not None:
+                    _m3d_h("HYB_in_hs_scale", _hssh, layer=_lid_h)
+                _tkh = getattr(masked_dispatch_output, "topk_output", None)
+                if _tkh is not None:
+                    _idsh = getattr(_tkh, "topk_ids", None)
+                    if _idsh is not None:
+                        _m3d_h("HYB_in_topk_ids", _idsh, layer=_lid_h)
+                _m3d_h("HYB_real_w13", layer.w13_weight, layer=_lid_h)
+                _m3d_h("HYB_real_w2", layer.w2_weight, layer=_lid_h)
+                _rw13s = getattr(layer, "w13_scale", None)
+                if _rw13s is not None:
+                    _m3d_h("HYB_real_w13_scale", _rw13s, layer=_lid_h)
             gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
             output = gpu_combine_input.hidden_states
+            if _m3d_h:
+                _m3d_h("HYB_out_hs", output, layer=_lid_h)
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)

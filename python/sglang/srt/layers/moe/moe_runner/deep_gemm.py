@@ -367,6 +367,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
+        try:
+            from sglang.srt.debug_utils.m3_dump_v2 import dump as _m3d_mg
+        except Exception:
+            _m3d_mg = None
+        _lid_mg = getattr(self.config, "layer_id", -1)
+        if _m3d_mg:
+            _m3d_mg("MG_pre_up_hs", hidden_states, layer=_lid_mg)
+            _m3d_mg("MG_pre_up_hs_scale", hidden_states_scale, layer=_lid_mg)
+            _m3d_mg("MG_pre_up_w13", w13_weight, layer=_lid_mg)
+            _m3d_mg("MG_pre_up_w13_scale", w13_scale, layer=_lid_mg)
+            _m3d_mg("MG_pre_up_masked_m", masked_m, layer=_lid_mg)
+            _m3d_mg("MG_pre_up_use_mxfp8", t=None, layer=_lid_mg, use_mxfp8=use_mxfp8)
         if use_mxfp8 and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
             # Hopper MXFP8 fallback: deep_gemm masked has no recipe knob.
             _triton_mxfp8_grouped_gemm_masked(
@@ -388,6 +400,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 masked_m,
                 expected_m,
             )
+        if _m3d_mg:
+            _m3d_mg("MG_post_up_gateup", gateup_output, layer=_lid_mg)
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -431,6 +445,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # + per-token-group fp8 quant in Python; otherwise use the fast path.
         gemm1_alpha = getattr(self.config, "gemm1_alpha", None)
         gemm1_clamp_limit = getattr(self.config, "gemm1_clamp_limit", None)
+        # M3-SWIGLU-PROBE: confirm whether the full-fallback runner config
+        # carries swiglu_oai params. The hybrid path was fixed in 8469f58a8;
+        # this probe checks whether the full-GPU-prefill fallback path also
+        # plumbs gemm1_alpha (or silently falls to plain silu = garbage).
+        import os as _swiglu_probe_os, torch as _swiglu_probe_torch
+        if (_swiglu_probe_os.environ.get("M3_PROBE_SWIGLU") == "1"
+            and not _swiglu_probe_torch.cuda.is_current_stream_capturing()):
+            _pc = getattr(DeepGemmRunnerCore, "_swiglu_probe_count", 0)
+            if _pc < 4 and int(masked_m.max()) > 10:
+                DeepGemmRunnerCore._swiglu_probe_count = _pc + 1
+                print(
+                    f"[M3-SWIGLU-PROBE #{_pc}] gemm1_alpha={gemm1_alpha} "
+                    f"gemm1_clamp_limit={gemm1_clamp_limit} "
+                    f"config_type={type(self.config).__name__} "
+                    f"all_config_fields={[a for a in dir(self.config) if not a.startswith('_') and not callable(getattr(self.config, a, None))]} "
+                    f"is_2604b={envs.SGLANG_DSV4_2604_SUBMODE.get() == '2604B'} "
+                    f"swiglu_limit_self={self.swiglu_limit}",
+                    flush=True,
+                )
         if gemm1_alpha is not None:
             from sglang.srt.layers.quantization.fp8_kernel import (
                 sglang_per_token_group_quant_fp8,
@@ -450,6 +483,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_input_scale = down_input_scale.view(
                 num_groups_act, max_m_act, -1
             )
+            if _m3d_mg:
+                _m3d_mg("MG_post_silu_din", down_input, layer=_lid_mg)
+                _m3d_mg("MG_post_silu_din_scale", down_input_scale, layer=_lid_mg)
+                _m3d_mg("MG_post_silu_gate_clamp", t=None, layer=_lid_mg, alpha=gemm1_alpha, clamp=gemm1_clamp_limit)
             del act_out, gate, up
         else:
             down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
@@ -489,6 +526,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
+        if _m3d_mg:
+            _m3d_mg("MG_pre_down_din", down_input, layer=_lid_mg)
+            _m3d_mg("MG_pre_down_din_scale", down_input_scale, layer=_lid_mg)
+            _m3d_mg("MG_pre_down_w2", w2_weight, layer=_lid_mg)
+            _m3d_mg("MG_pre_down_w2_scale", w2_scale, layer=_lid_mg)
         if use_mxfp8 and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
             _triton_mxfp8_grouped_gemm_masked(
                 down_input,
@@ -517,6 +559,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
 
+        if _m3d_mg:
+            _m3d_mg("MG_post_down_out", down_output, layer=_lid_mg)
         return down_output
 
     @property

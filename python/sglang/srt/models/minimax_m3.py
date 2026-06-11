@@ -863,6 +863,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
+        try:
+            from sglang.srt.debug_utils.m3_dump_v2 import dump as _m3d
+        except Exception:
+            _m3d = None
+
+        _lid = getattr(self, "layer_id", -1)
+        if _m3d:
+            _m3d("L_in_hs", hidden_states, layer=_lid)
+            _m3d("L_in_residual", residual, layer=_lid)
+
         # Self Attention
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -873,6 +883,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 **kwargs,
             )
         )
+        if _m3d:
+            _m3d("L_post_pre_attn_hs", hidden_states, layer=_lid)
+            _m3d("L_post_pre_attn_res", residual, layer=_lid)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -880,11 +893,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        if _m3d:
+            _m3d("L_post_attn", hidden_states, layer=_lid)
 
         # Fully Connected (MLP or MoE)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        if _m3d:
+            _m3d("L_pre_mlp_hs", hidden_states, layer=_lid)
+            _m3d("L_pre_mlp_res", residual, layer=_lid)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -903,6 +921,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 should_allreduce_fusion,
                 use_reduce_scatter,
             )
+        if _m3d:
+            _m3d("L_post_mlp", hidden_states, layer=_lid)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -910,6 +930,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+        if _m3d:
+            _m3d("L_out_hs", hidden_states, layer=_lid)
+            _m3d("L_out_residual", residual, layer=_lid)
 
         return hidden_states, residual
 
