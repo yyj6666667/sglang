@@ -50,7 +50,14 @@ def _grouped_mxfp8_gemm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    expert_id = tl.program_id(axis=2)
+    # Promote expert_id to int64 before any stride multiplication. With
+    # num_experts=128 and stride_a_e = max_m * K (e.g. 4096*6144 = 25M
+    # elements), expert_id * stride_a_e exceeds 2^31 for expert_id >= 86
+    # and overflows signed int32, wrapping to a negative offset → CUDA
+    # illegal memory access. The earlier hybrid 8-expert micro-batches
+    # never tripped this because 8 * stride was within 2^31. Origin:
+    # bug in the M3 full-GPU prefill fallback path (kt_ep_wrapper.py:2562).
+    expert_id = tl.program_id(axis=2).to(tl.int64)
     actual_m = tl.load(masked_m_ptr + expert_id)
 
     pid = tl.program_id(axis=0)
