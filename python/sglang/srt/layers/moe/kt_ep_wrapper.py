@@ -324,6 +324,7 @@ class SharedFullContext:
         # prefill fallback compat).
         if self.gpu_method.__class__.__name__ == "DeepSeekMxfp4MoEMethod":
             self.is_mxfp4_quant = True
+            self.is_mxfp8_quant = False
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = False
@@ -332,6 +333,26 @@ class SharedFullContext:
         # INT4 Marlin
         if hasattr(layer, "w13_weight_packed") and hasattr(layer, "w2_weight_packed"):
             self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
+            return
+
+        # M3 MXFP8 block (must come before FP8 block — both register
+        # `w13_weight_scale_inv`, but MXFP8 stores uint8 ue8m0 scales with
+        # block_size=[1,32] while FP8 block uses fp32/fp8 scales with
+        # block_size=[128,128]). The `format_ue8m0` attribute set by
+        # Fp8MoEMethod.create_weights when use_mxfp8=True (fp8.py:893-894)
+        # is the canonical discriminator. Origin: kt-sglang 耦合 (M3 MXFP8
+        # full-GPU prefill fallback).
+        if (
+            hasattr(layer, "w13_weight_scale_inv")
+            and hasattr(layer, "w2_weight_scale_inv")
+            and getattr(layer.w13_weight_scale_inv, "format_ue8m0", False)
+        ):
+            self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = True
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = False
@@ -340,6 +361,7 @@ class SharedFullContext:
         # FP8 block
         if hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv"):
             self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
             self.is_fp8_quant = True
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = False
@@ -348,6 +370,7 @@ class SharedFullContext:
         # FP8 per-channel
         if hasattr(layer, "w13_weight_scale") and hasattr(layer, "w2_weight_scale"):
             self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = True
             self.is_bf16_quant = False
@@ -356,6 +379,7 @@ class SharedFullContext:
         # BF16 / unquantized
         if hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight"):
             self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = True
@@ -363,6 +387,7 @@ class SharedFullContext:
 
         # Fallback to class-based detection for unknown layouts.
         self.is_mxfp4_quant = False
+        self.is_mxfp8_quant = False
         self.is_fp8_quant = self._detect_fp8_quant()
         self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
         self.is_bf16_quant = self._detect_bf16_quant()
@@ -480,6 +505,12 @@ class SharedFullContext:
             # w13_weight_scale_inv, w2_weight, w2_weight_scale_inv); the
             # underlying byte payload differs (FP4 nibble + ue8m0 scale) but
             # the staging buffers don't care about content.
+            return self.WEIGHT_NAMES_FP8
+        if getattr(self, "is_mxfp8_quant", False):
+            # M3 MXFP8 uses the same flat names as FP8 block. Payload differs
+            # (FP8 e4m3 weights + uint8 ue8m0 scales with block_size=[1,32]
+            # vs FP8 block's fp32 scales with [128,128]). Staging buffers are
+            # byte-agnostic so name reuse is safe.
             return self.WEIGHT_NAMES_FP8
         if self.is_fp8_quant:
             return self.WEIGHT_NAMES_FP8
@@ -1030,6 +1061,98 @@ class SharedFullContext:
             torch.cuda.synchronize()
         self.gpu_method.process_weights_after_loading(self.gpu_layer)
 
+    def _prepare_weight_mxfp8(self, wrapper, original_layer=None, gpu_experts_mask=None,
+                              logical_to_gpu_index=None):
+        """Prepare M3 MXFP8 weights for the full-GPU prefill fallback.
+
+        M3 MXFP8 routed experts share flat attribute names with FP8 block
+        (`w13_weight` / `w13_weight_scale_inv` / `w2_weight` / `w2_weight_scale_inv`)
+        but the scale is uint8 ue8m0 (1 byte per group of 32 weight elements),
+        not FP32. The CPU buffer dtype derived from
+        `gpu_layer.w13_weight_scale_inv.dtype` (uint8, allocated by
+        `Fp8MoEMethod.create_weights` when `use_mxfp8=True` at fp8.py:872-893)
+        plus the canonical shape `(num_experts, 2*I//32, H//32)` matches
+        exactly what the kt-kernel C++ side writes via `fast_fp32_to_ue8m0`
+        (mxfp8-moe.hpp:638-658, used at lines 741, 745, 747). Therefore the
+        FP8 byte-copy machinery transports the right bytes for the CPU
+        expert path.
+
+        Two adjustments vs `_prepare_weight_mxfp4`:
+
+        1. Phase 1 (GPU-to-GPU shortcut for the 8 GPU-resident experts) is
+           DISABLED — `original_layer=None` and `gpu_experts_mask=None`
+           force all 128 experts through Phase 2 (CPU buffer via kt-kernel
+           C++ wrapper). Reason:
+           `Fp8MoEMethod.process_weights_after_loading_block_quant` mutates
+           the real layer's `w13_weight_scale_inv.data` into a swizzled /
+           fp32-decoded form (fp8.py:1234-1242 → block_quant branch →
+           `_process_mxfp8_moe_weights`), so `original_layer[gpu_idx]`'s
+           scale is no longer the canonical uint8 ue8m0 bytes that fit
+           gpu_layer's uint8 slot. Cost: ~6% extra wall-time for 8
+           redundant CPU-path experts on a one-shot full-GPU prefill —
+           negligible. The MXFP4 path avoids this hazard because
+           `mxfp4_deepseek.py` gates the post-swizzle on
+           `kt_gpu_prefill_token_threshold > 0`; MXFP8 has no such gate
+           today, so we take the conservative path.
+
+        2. No `process_weights_after_loading` call. The Triton MXFP8
+           kernel host wrapper (`grouped_mxfp8_kernel.py:170-175`) accepts
+           canonical uint8 ue8m0 scales directly — converting fp32 → uint8
+           on the fly if needed. The block-quant post-processing on SM90
+           would swizzle / decode in ways unverified against the Triton
+           MoE kernel we use; defer that optimization to a later PR with
+           explicit kernel-layout co-design.
+
+        Origin: kt-sglang 耦合 (M3 MXFP8 full-GPU prefill fallback —
+        diagnosed via multi-stage hidden-states dump 2026-06-12).
+        """
+        # Phase 1+2: byte-copy via the FP8 path. Force original_layer=None to
+        # bypass the GPU-shortcut for the 8 GPU-resident experts (real layer's
+        # scale is already post-processed; doesn't fit canonical uint8 slot).
+        self._prepare_weight_fp8(
+            wrapper,
+            original_layer=None,
+            gpu_experts_mask=None,
+            logical_to_gpu_index=None,
+        )
+
+        # Verification log (rank 0, throttled — only first 3 layers per process).
+        # Pre-fix: w13/w2 nonzero == 0. Post-fix: nonzero > 90% of numel.
+        try:
+            tp_rank = get_tensor_model_parallel_rank()
+        except Exception:
+            tp_rank = -1
+        if tp_rank == 0:
+            _vc = getattr(SharedFullContext, "_mxfp8_verify_count", 0)
+            if _vc < 3:
+                SharedFullContext._mxfp8_verify_count = _vc + 1
+                _w13s = self.gpu_layer.w13_weight_scale_inv
+                _w2s = self.gpu_layer.w2_weight_scale_inv
+                _w13 = self.gpu_layer.w13_weight
+                _w2 = self.gpu_layer.w2_weight
+                _cpu_w13s = self.cpu_buffers["w13_weight_scale_inv"]
+                _cpu_w13 = self.cpu_buffers["w13_weight"]
+                logger.info(
+                    "M3 MXFP8 prepare verify: "
+                    "GPU w13_scale_inv nz=%d/%d dtype=%s shape=%s, "
+                    "GPU w13_weight nz=%d/%d dtype=%s shape=%s, "
+                    "GPU w2_scale_inv nz=%d/%d, w2_weight nz=%d/%d, "
+                    "CPU buf w13_scale_inv[slot0] nz=%d/%d dtype=%s shape=%s, "
+                    "CPU buf w13_weight[slot0] nz=%d/%d dtype=%s shape=%s, "
+                    "all_rank_ptrs w13_scale_inv len=%d",
+                    int((_w13s != 0).sum().item()), _w13s.numel(),
+                    _w13s.dtype, tuple(_w13s.shape),
+                    int((_w13 != 0).sum().item()), _w13.numel(),
+                    _w13.dtype, tuple(_w13.shape),
+                    int((_w2s != 0).sum().item()), _w2s.numel(),
+                    int((_w2 != 0).sum().item()), _w2.numel(),
+                    int((_cpu_w13s[0] != 0).sum().item()), _cpu_w13s[0].numel(),
+                    _cpu_w13s.dtype, tuple(_cpu_w13s.shape),
+                    int((_cpu_w13[0] != 0).sum().item()), _cpu_w13[0].numel(),
+                    _cpu_w13.dtype, tuple(_cpu_w13.shape),
+                    len(self.all_rank_buffer_ptrs.get("w13_weight_scale_inv", [])),
+                )
+
     def _prepare_weight_fp8_channel(self, wrapper, original_layer=None, gpu_experts_mask=None,
                                      logical_to_gpu_index=None):
         """Prepare FP8 per-channel quant weights by writing from KT and copying to GPU.
@@ -1379,6 +1502,12 @@ class SharedFullContext:
             # V4-Flash MXFP4: byte-copy via FP8 path + re-swizzle into
             # triton_kernels form. Origin: sglang 本身.
             self._prepare_weight_mxfp4(wrapper, original_layer, gpu_experts_mask,
+                                       logical_to_gpu_index)
+        elif getattr(self, "is_mxfp8_quant", False):
+            # M3 MXFP8: byte-copy via FP8 path with original_layer=None
+            # (Phase 1 shortcut disabled — real layer's scale is post-processed).
+            # Origin: kt-sglang 耦合.
+            self._prepare_weight_mxfp8(wrapper, original_layer, gpu_experts_mask,
                                        logical_to_gpu_index)
         elif self.is_fp8_quant:
             self._prepare_weight_fp8(wrapper, original_layer, gpu_experts_mask,
