@@ -73,11 +73,13 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
     log_info_on_rank0,
+    mxfp8_block_convert_required,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -93,6 +95,8 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_gfx95_supported = is_gfx95_supported()
+_mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
@@ -155,6 +159,8 @@ class Fp8Config(QuantizationConfig):
         return [torch.bfloat16, torch.half]
 
     def get_min_capability(self) -> int:
+        if self.use_mxfp8 and _mxfp8_to_block_fp8_required:
+            return 80
         return 100 if self.use_mxfp8 else 80
 
     @classmethod
