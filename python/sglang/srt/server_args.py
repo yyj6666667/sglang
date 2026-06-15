@@ -56,6 +56,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    mxfp8_block_convert_required,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -2424,12 +2425,51 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
-            if self.moe_runner_backend not in ["auto", "cutlass"]:
+            if is_hip():
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "triton"
+                elif self.moe_runner_backend not in [
+                    "triton",
+                    "cutlass",
+                    "deep_gemm",
+                    "flashinfer_trtllm",
+                    "flashinfer_trtllm_routed",
+                ]:
+                    logger.warning(
+                        "mxfp8 quantization on ROCm supports triton, cutlass, "
+                        "deep_gemm, flashinfer_trtllm, or flashinfer_trtllm_routed "
+                        f"backends. Overriding {self.moe_runner_backend!r}."
+                    )
+                    self.moe_runner_backend = "triton"
+            elif mxfp8_block_convert_required():
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "triton"
+                elif self.moe_runner_backend not in [
+                    "triton",
+                    "cutlass",
+                    "deep_gemm",
+                    "flashinfer_trtllm",
+                    "flashinfer_trtllm_routed",
+                ]:
+                    logger.warning(
+                        "mxfp8 block-fp8 conversion supports triton, cutlass, "
+                        "deep_gemm, flashinfer_trtllm, or flashinfer_trtllm_routed "
+                        f"backends. Overriding {self.moe_runner_backend!r}."
+                    )
+                    self.moe_runner_backend = "triton"
+            elif self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_trtllm"
+            elif self.moe_runner_backend not in [
+                "cutlass",
+                "deep_gemm",
+                "flashinfer_trtllm",
+                "flashinfer_trtllm_routed",
+            ]:
                 logger.warning(
                     "mxfp8 quantization forces --moe-runner-backend=cutlass. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
-            self.moe_runner_backend = "cutlass"
+                self.moe_runner_backend = "cutlass"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
