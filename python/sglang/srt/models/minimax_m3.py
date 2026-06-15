@@ -217,9 +217,10 @@ class _FusedQKVIndexProj(nn.Module):
                 "weight_scale_inv", nn.Parameter(weight_scale_inv, requires_grad=False)
             )
             self.weight_scale_inv.format_ue8m0 = True
-            # Derive the backend scale layout (deep_gemm packed / swizzled) once,
-            # exactly as process_weights_after_loading would for a real linear.
-            quant_method._process_mxfp8_linear_weight_scale(self)
+            if getattr(quant_method, "convert_mxfp8_to_block", False):
+                quant_method.process_weights_after_loading_block_quant(self)
+            else:
+                quant_method._process_mxfp8_linear_weight_scale(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._qm.apply(self, x, None)
