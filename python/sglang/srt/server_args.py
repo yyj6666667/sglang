@@ -722,6 +722,8 @@ class ServerArgs:
     kt_threadpool_count: Optional[int] = None
     kt_num_gpu_experts: Optional[int] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
+    kt_swiglu_alpha: float = 0.0
+    kt_swiglu_limit: float = 0.0
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -3918,6 +3920,13 @@ class ServerArgs:
                 "flashinfer_cutedsl",
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
 
+        if self.kt_weight_path is not None and not self.disable_shared_experts_fusion:
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "KTransformers EP is enabled. --disable-shared-experts-fusion is automatically set "
+                "to prevent shared experts from being offloaded to CPU."
+            )
+
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
             if self.deepep_mode == "auto":
@@ -6744,6 +6753,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kt_max_deferred_experts_per_token,
             help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+        )
+        parser.add_argument(
+            "--kt-swiglu-alpha",
+            type=float,
+            default=ServerArgs.kt_swiglu_alpha,
+            help="[ktransformers parameter] SwiGLU sigmoid alpha for CPU MoE activation. Non-zero triggers gate*sigmoid(gate*alpha)*(up+1). M3 uses 1.702.",
+        )
+        parser.add_argument(
+            "--kt-swiglu-limit",
+            type=float,
+            default=ServerArgs.kt_swiglu_limit,
+            help="[ktransformers parameter] SwiGLU clamp limit for CPU MoE activation. M3 uses 7.0.",
         )
 
         # Diffusion LLM

@@ -55,6 +55,8 @@ class KTConfig:
     chunked_prefill_size: int
     max_deferred_experts_per_token: int
     method: str
+    swiglu_alpha: float = 0.0
+    swiglu_limit: float = 0.0
     num_layers: Optional[int] = None
 
 
@@ -91,6 +93,8 @@ def create_kt_config_from_server_args(
         chunked_prefill_size=server_args.chunked_prefill_size,
         method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
+        swiglu_alpha=server_args.kt_swiglu_alpha,
+        swiglu_limit=server_args.kt_swiglu_limit,
         num_layers=num_layers,
     )
 
@@ -216,19 +220,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
+            gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
+            gpu_experts_mask[: self.num_gpu_experts] = True
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
+                gpu_experts_mask=gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
+                swiglu_alpha=self.kt_config.swiglu_alpha,
+                swiglu_limit=self.kt_config.swiglu_limit,
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -286,10 +294,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
         """
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
-
         if self.tp_rank != 0 or self.wrapper is None:
             return
 
