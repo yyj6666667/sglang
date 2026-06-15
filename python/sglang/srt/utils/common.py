@@ -3677,6 +3677,25 @@ def mxfp8_block_convert_required():
     return is_gfx942_supported() and not is_gfx95_supported()
 
 
+@lru_cache(maxsize=1)
+def mxfp8_moe_block_convert_required():
+    """Whether MXFP8 MoE experts must be converted to block-fp8 [128,128] at load.
+
+    Same conversion as :func:`mxfp8_block_convert_required` but for the MoE
+    expert weights specifically. In addition to gfx942 (no MX matmul HW), this
+    is True on sm90 (Hopper) because there is no native MXFP8 grouped GEMM
+    kernel for Hopper -- only Blackwell's ``es_sm100_mxfp8_blockscaled_grouped_mm``
+    (tcgen05) and gfx95's ``mfma_scale``. Converting MXFP8 expert weights to
+    block-fp8 [128,128] at load lets the experts run through the production
+    block-fp8 grouped GEMM path (DeepSeek-V3 / GLM-4.5 production kernels:
+    ``es_fp8_blockwise_scaled_grouped_mm`` / DeepGEMM Hopper / Triton fused
+    block-fp8 MoE), which on Hopper is the fastest available FP8 MoE path.
+    """
+    if torch.version.hip:
+        return is_gfx942_supported() and not is_gfx95_supported()
+    return is_sm90_supported()
+
+
 def get_hip_version():
     if torch.version.hip:
         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))

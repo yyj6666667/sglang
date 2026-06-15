@@ -93,6 +93,7 @@ from sglang.srt.utils import (
     is_sm120_supported,
     log_info_on_rank0,
     mxfp8_block_convert_required,
+    mxfp8_moe_block_convert_required,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -116,6 +117,11 @@ _is_gfx95_supported = is_gfx95_supported()
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
+# MoE-only variant: also True on sm90 (Hopper has no native MXFP8 grouped GEMM,
+# so MoE experts are converted to block-fp8 [128,128] and run through the
+# Hopper block-fp8 grouped GEMM path). Linear layers stay on their own MXFP8
+# dispatch (Triton tl.dot_scaled / DeepGEMM Hopper MXFP8).
+_mxfp8_moe_to_block_fp8_required = mxfp8_moe_block_convert_required()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
@@ -218,6 +224,11 @@ class Fp8Config(QuantizationConfig):
             # gfx942 has no MX matmul HW; MXFP8 is converted to block-fp8 at
             # load. Reported device capability there is 94.
             return 94
+        if self.use_mxfp8 and _mxfp8_moe_to_block_fp8_required:
+            # sm90 (Hopper): MoE experts are converted to block-fp8 at load and
+            # run through the Hopper block-fp8 grouped GEMM path. Linear stays
+            # on the native sm90 MXFP8 dispatch.
+            return 90
 
         return 100 if self.use_mxfp8 else 80
 
@@ -939,9 +950,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        # gfx942: convert MXFP8 experts -> block-fp8 [128,128] at load (see
-        # Fp8LinearMethod). Weights still load as MXFP8 (1x32) first.
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        # gfx942 / sm90: convert MXFP8 experts -> block-fp8 [128,128] at load.
+        # Weights still load as MXFP8 (1x32) first; conversion runs in
+        # process_weights_after_loading_block_quant. The MoE gate is broader
+        # than the linear gate because Hopper has no native MXFP8 grouped GEMM
+        # kernel (only Blackwell tcgen05 and gfx95 mfma_scale), whereas linear
+        # has working sm90 MXFP8 dispatchers (Triton / DeepGEMM Hopper).
+        self.convert_mxfp8_to_block = (
+            self.use_mxfp8 and _mxfp8_moe_to_block_fp8_required
+        )
         self.weight_block_size = self.quant_config.weight_block_size
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.with_bias = False
@@ -1350,10 +1367,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return
 
         if self.convert_mxfp8_to_block:
-            # gfx942: convert MXFP8 experts -> block-fp8 [128,128] (e4m3fn+fp32),
-            # then fnuz-normalize for the MI300 HW. Only aiter-shuffle the weights
-            # when the active MoE runner is aiter; the triton runner consumes
-            # un-shuffled weights (shuffling for the wrong runner corrupts output).
+            # gfx942 / sm90: convert MXFP8 experts -> block-fp8 [128,128]
+            # (e4m3fn+fp32). On gfx942 the fnuz-normalize + aiter-shuffle blocks
+            # below additionally adapt the weights for the MI300 HW; both are
+            # no-ops on sm90 because `_is_fp8_fnuz` and `_use_aiter` are False
+            # on CUDA. Only aiter-shuffle when the active MoE runner is aiter;
+            # the triton runner consumes un-shuffled weights (shuffling for the
+            # wrong runner corrupts output).
             self._convert_mxfp8_moe_to_block_fp8(layer)
             self.use_mxfp8 = False
             self.convert_mxfp8_to_block = False
@@ -1514,10 +1534,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale_inv.format_ue8m0 = True
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
-        """gfx942: convert MXFP8 experts (e4m3fn + 1x32 UE8M0) to block-fp8
-        [128,128] (e4m3fn + fp32) in place. w13/w2 stay [E, N, K]; scales become
-        [E, ceil(N/128), ceil(K/128)] fp32. The downstream ROCm path normalizes
-        e4m3fn -> e4m3fnuz."""
+        """gfx942 / sm90: convert MXFP8 experts (e4m3fn + 1x32 UE8M0) to
+        block-fp8 [128,128] (e4m3fn + fp32) in place. w13/w2 stay [E, N, K];
+        scales become [E, ceil(N/128), ceil(K/128)] fp32. On gfx942 the
+        downstream ROCm path additionally normalizes e4m3fn -> e4m3fnuz; on
+        sm90 the experts feed directly into the Hopper block-fp8 grouped GEMM
+        path (es_fp8_blockwise_scaled_grouped_mm / DeepGEMM Hopper / Triton)."""
         from sglang.srt.layers.quantization.mxfp8_block_convert import (
             convert_mxfp8_weight_to_block_fp8,
         )
@@ -1549,8 +1571,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             (_is_cuda and is_sm100_supported()) or (_is_hip and _is_gfx95_supported)
         ):
             raise RuntimeError(
-                "MXFP8 MoE quantization requires SM100 or ROCm gfx95 "
-                "(gfx942 converts MXFP8 to block-fp8 at load instead)."
+                "Native MXFP8 MoE quantization requires SM100 or ROCm gfx95 "
+                "(gfx942 and sm90 convert MXFP8 to block-fp8 at load instead)."
             )
 
         def _quantize_and_swizzle_with_cutlass_es_kernel(weight: torch.Tensor):
@@ -2055,8 +2077,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             pass
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
-        # gfx942 converts MXFP8 experts to block-fp8 at load (self.use_mxfp8 is
-        # then False), so native MXFP8 MoE only runs on gfx95.
+        # gfx942 / sm90 convert MXFP8 experts to block-fp8 at load (self.use_mxfp8
+        # is then False), so native MXFP8 MoE only runs on gfx95.
         use_rocm_mxfp8 = self.use_mxfp8 and _is_hip and _is_gfx95_supported
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
