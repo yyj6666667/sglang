@@ -112,3 +112,9 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             image_size=image_size,
         )
         return radio_config
+
+
+# auto-stub: classes expected by configs/__init__.py
+class NemotronH_Nano_Omni_Reasoning_V3_Config:
+    pass
+

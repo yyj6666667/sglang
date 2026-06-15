@@ -14,6 +14,8 @@
 """Common utilities."""
 
 from __future__ import annotations
+# Re-export network helpers (network.py was split out from common.py in #20646).
+from sglang.srt.utils.network import *  # noqa: F401,F403,E402
 
 import argparse
 import asyncio
@@ -4201,3 +4203,31 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+# ---------------------------------------------------------------------------
+# Patch: configure_ipv6 stub
+# Removed upstream by #20306 (NetworkAddress refactor) but PR #27944 still
+# imports it. Local restoration for cascade-merge compatibility.
+# ---------------------------------------------------------------------------
+def configure_ipv6(dist_init_addr):
+    addr = dist_init_addr
+    end = addr.find("]")
+    if end == -1:
+        raise ValueError("invalid IPv6 address format: missing ]")
+    host = addr[: end + 1]
+    if not is_valid_ipv6_address(host[1:end]):
+        raise ValueError(f"invalid IPv6 address: {host}")
+    port_str = None
+    if len(addr) > end + 1:
+        if addr[end + 1] == ":":
+            port_str = addr[end + 2 :]
+        else:
+            raise ValueError("received IPv6 address format: expected : after ]")
+    if not port_str:
+        raise ValueError("a port must be specified in IPv6 address (format: [ipv6]:port)")
+    try:
+        port = int(port_str)
+    except ValueError:
+        raise ValueError(f"invalid port in IPv6 address: {port_str!r}")
+    return port, host

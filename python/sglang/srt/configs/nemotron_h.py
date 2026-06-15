@@ -312,3 +312,9 @@ class NemotronHConfig(PretrainedConfig):
         return Mamba2CacheParams(
             shape=shape, layers=self.mamba_layer_ids, dtype=mamba2_state_dtype(self)
         )
+
+
+# auto-stub: classes expected by configs/__init__.py
+class NemotronHPuzzleConfig:
+    pass
+
