@@ -80,6 +80,7 @@ from sglang.srt.utils.common import (
     is_host_cpu_arm64,
     is_mps,
     is_musa,
+    mxfp8_block_convert_required,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -3636,6 +3637,22 @@ class ServerArgs:
                 ]:
                     logger.warning(
                         "mxfp8 quantization on ROCm supports triton, cutlass, "
+                        "deep_gemm, flashinfer_trtllm, or flashinfer_trtllm_routed "
+                        f"backends. Overriding {self.moe_runner_backend!r}."
+                    )
+                    self.moe_runner_backend = "triton"
+            elif mxfp8_block_convert_required():
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "triton"
+                elif self.moe_runner_backend not in [
+                    "triton",
+                    "cutlass",
+                    "deep_gemm",
+                    "flashinfer_trtllm",
+                    "flashinfer_trtllm_routed",
+                ]:
+                    logger.warning(
+                        "mxfp8 block-fp8 conversion supports triton, cutlass, "
                         "deep_gemm, flashinfer_trtllm, or flashinfer_trtllm_routed "
                         f"backends. Overriding {self.moe_runner_backend!r}."
                     )
