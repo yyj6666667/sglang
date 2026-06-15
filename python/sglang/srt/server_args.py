@@ -1515,6 +1515,10 @@ class ServerArgs:
                 "DSA prefill context parallelism",
                 lambda: self.enable_dsa_prefill_context_parallel,
             ),
+            (
+                "MXFP8→block-fp8 conversion (aten.mm.dtype unsupported by dynamo)",
+                lambda: self.quantization == "mxfp8" and mxfp8_block_convert_required(),
+            ),
         ]
         for _name, predicate in rules:
             if predicate():
