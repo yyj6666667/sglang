@@ -3673,6 +3673,10 @@ def mxfp8_block_convert_required():
     returns False there).
     """
     if not torch.version.hip:
+        # SM90 (Hopper H20/H100) lacks MX matmul HW; convert to block-fp8
+        cap = torch.cuda.get_device_capability()
+        if cap[0] < 10:
+            return True
         return False
     return is_gfx942_supported() and not is_gfx95_supported()
 

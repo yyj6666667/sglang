@@ -215,9 +215,8 @@ class Fp8Config(QuantizationConfig):
         if self.use_mxfp8 and _is_hip and _is_gfx95_supported:
             return 95
         if self.use_mxfp8 and _mxfp8_to_block_fp8_required:
-            # gfx942 has no MX matmul HW; MXFP8 is converted to block-fp8 at
-            # load. Reported device capability there is 94.
-            return 94
+            # No MX matmul HW (gfx942 or SM90); MXFP8 converted to block-fp8
+            return 80
 
         return 100 if self.use_mxfp8 else 80
 
