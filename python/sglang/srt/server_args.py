@@ -2564,6 +2564,13 @@ class ServerArgs:
                 "flashinfer_cutlass"
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
 
+        if self.kt_weight_path is not None and not self.disable_shared_experts_fusion:
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "KTransformers EP is enabled. --disable-shared-experts-fusion is automatically set "
+                "to prevent shared experts from being offloaded to CPU."
+            )
+
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
             logger.warning(
