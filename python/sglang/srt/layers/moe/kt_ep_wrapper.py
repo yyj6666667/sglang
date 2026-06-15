@@ -108,6 +108,7 @@ class KTConfig:
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
     expert_lora_path: Optional[str] = None
+    swiglu_alpha: float = 0.0
 
 
 @dataclass
@@ -2011,6 +2012,7 @@ def create_kt_config_from_server_args(
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
+        swiglu_alpha=getattr(hf_config, "swiglu_alpha", 0.0),
     )
 
 
@@ -2483,6 +2485,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # and the default 10.0 set for 2604B in mxfp4_deepseek.py.
             # Origin: kt-sglang 耦合 (carries V4-2604B limit into kt-kernel).
             from sglang.srt.environ import envs as _envs
+            _kt_swiglu_alpha = self.kt_config.swiglu_alpha
             _kt_swiglu_limit = (
                 10.0 if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" else 0.0
             )
@@ -2525,6 +2528,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 self.wrapper = KTMoEWrapper(
                     **common_wrapper_kwargs,
                     swiglu_limit=_kt_swiglu_limit,
+                    swiglu_alpha=_kt_swiglu_alpha,
                     method=self.kt_config.method,
                     max_deferred_experts_per_token=layer_max_deferred,
                 )
