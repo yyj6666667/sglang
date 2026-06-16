@@ -1992,6 +1992,42 @@ class ServerArgs:
         ):
             self.enable_flashinfer_allreduce_fusion = True
 
+        if model_arch in [
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+        ]:
+            quant_method = get_quantization_config(hf_config)
+            if (
+                self.quantization is None
+                and not self._quantization_explicitly_unset
+                and quant_method is not None
+            ):
+                self.quantization = quant_method
+
+            if is_hip():
+                if self.is_attention_backend_not_set():
+                    self.attention_backend = "triton"
+                if self.moe_runner_backend == "auto" and self.quantization == "mxfp8":
+                    self.moe_runner_backend = "triton"
+            elif is_sm100_supported():
+                if self.is_attention_backend_not_set():
+                    self.attention_backend = "fa4"
+                if self.page_size is None and self.attention_backend == "fa4":
+                    self.page_size = 128
+                if self.moe_runner_backend == "auto" and self.quantization == "mxfp8":
+                    self.moe_runner_backend = "deep_gemm"
+
+            if self.quantization is None and self.moe_runner_backend in (
+                "auto",
+                "deep_gemm",
+            ):
+                if self.moe_runner_backend == "deep_gemm":
+                    logger.warning(
+                        "MiniMax-M3: the deep_gemm MoE runner produces corrupted output "
+                        "on bf16 full weights; overriding --moe-runner-backend to 'triton'."
+                    )
+                self.moe_runner_backend = "triton"
+
     def _handle_mamba_radix_cache(
         self,
         model_arch: str,
