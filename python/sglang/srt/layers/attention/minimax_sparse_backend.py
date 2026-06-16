@@ -463,7 +463,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
         attn_fn = None
-        if self.use_dense_sparse_decode and k_cache.shape[1] == 1:
+        if (
+            self.use_dense_sparse_decode
+            and k_cache.shape[1] == 1
+            and self.dense_backend is not None
+            and hasattr(self.dense_backend, "workspace_buffer")
+        ):
 
             def attn_fn(main_q, page_table, real_seq_lens):
                 return self._dense_sparse_main_decode(

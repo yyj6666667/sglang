@@ -285,7 +285,7 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
-        tokenizer = _processor.tokenizer
+        tokenizer = getattr(_processor, "tokenizer", _processor)
         assert tokenizer is not None, "tokenizer is required"
 
         self.IM_TOKEN_ID = self._token_id(tokenizer, self.IMAGE_TOKEN)
