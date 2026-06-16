@@ -929,6 +929,17 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
+        if (
+            self.enable_piecewise_cuda_graph
+            and self.quantization == "mxfp8"
+            and mxfp8_block_convert_required()
+        ):
+            logger.warning(
+                "Piecewise CUDA graph is disabled for MXFP8→block-fp8 conversion "
+                "(aten.mm.dtype unsupported by dynamo)."
+            )
+            self.enable_piecewise_cuda_graph = False
+
         # Handle device-specific backends.
         self._handle_hpu_backends()
         self._handle_cpu_backends()
