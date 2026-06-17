@@ -292,6 +292,12 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         self.VIDEO_TOKEN_ID = self._token_id(tokenizer, self.VIDEO_TOKEN)
         self.IM_START_TOKEN_ID = self._token_id(tokenizer, self.IMAGE_START_TOKEN)
         self.IM_END_TOKEN_ID = self._token_id(tokenizer, self.IMAGE_END_TOKEN)
+        # mm_process_config buckets carry user-facing tunables for image/video
+        # preprocessing (frame sampling fps / max_frames / frame_max_size, etc).
+        # Mirrors qwen_vl.py:261-262. Without this init the .pop() calls below
+        # raise AttributeError under sglang.serve.
+        self.image_config = server_args.mm_process_config.get("image", {})
+        self.video_config = server_args.mm_process_config.get("video", {})
         self.video_fps = self.video_config.pop("fps", None)
         self.video_frame_max_size = self.video_config.pop("frame_max_size", None)
         self.video_max_frames = self.video_config.pop("max_frames", None)
@@ -333,7 +339,10 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
             Dict with input_ids, mm_items, token IDs
         """
 
-        base_output = await self.load_mm_data(
+        # BaseMultimodalProcessor.load_mm_data is sync (base_processor.py:622);
+        # M3 was awaiting it which raised "can't be used in 'await' expression"
+        # on first /v1/chat/completions request and aborted warmup.
+        base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
@@ -358,11 +367,16 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
-        # Step 3: Call base process_and_combine_mm_data which uses self._processor
+        # Step 3: Call base process_and_combine_mm_data which uses self._processor.
+        # video_metadata is forwarded as a tokenizer kwarg; HF tokenizer rejects
+        # unknown kwargs, so only pass it when we actually processed videos.
+        extra_kwargs = {}
+        if video_metadata is not None:
+            extra_kwargs["video_metadata"] = video_metadata
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
             base_output=base_output,
             mm_tokens=self.mm_tokens,
-            video_metadata=video_metadata,
+            **extra_kwargs,
         )
 
         return MultimodalProcessorOutput(
