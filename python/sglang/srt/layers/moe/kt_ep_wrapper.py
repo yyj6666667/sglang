@@ -355,49 +355,23 @@ class SharedFullContext:
         # Create CPU buffers once for weight loading (shared across layers)
         self._create_cpu_buffers()
 
-        # For M3 MXFP8 layerwise prefill, pre-allocate the auxiliary
-        # tensors used by `_prepare_weight_mxfp8` to bridge byte-copy
-        # (uint8 UE8M0 [1,32]) -> apply (fp32 block-FP8 [128,128]).
-        # See `_prepare_weight_mxfp8` for the full state machine.
+        # For M3 MXFP8 layerwise prefill, cache the canonical uint8 ue8m0
+        # scale Parameter objects so `_prepare_weight_mxfp8` can rebind to
+        # them before each byte-copy. Native MXFP8 path keeps the scale in
+        # this layout throughout (no convert to block-fp8).
         if getattr(self, "is_mxfp8_quant", False):
-            self._init_mxfp8_block_fp8_aux()
+            self._init_mxfp8_aux()
 
-    def _init_mxfp8_block_fp8_aux(self) -> None:
-        """Pre-allocate the MXFP8/block-FP8 dual-layout scale tensors.
+    def _init_mxfp8_aux(self) -> None:
+        """Cache the canonical uint8 ue8m0 [E, N, K//32] scale Parameters.
 
-        `_w13_scale_mxfp8_param` and `_w2_scale_mxfp8_param` are the original
-        uint8 [E, N, K/32] Parameter objects allocated by Fp8MoEMethod.
-        create_weights (use_mxfp8=True); these stay as the byte-copy target.
-
-        `_w13_scale_block_fp8` and `_w2_scale_block_fp8` are fresh fp32 plain
-        Tensors with shape [E, N/128, K/128]; the convert kernel writes
-        into them after byte-copy and they get wrapped in a Parameter and
-        bound to `gpu_layer.{w13,w2}_weight_scale_inv` for `gpu_method.apply`.
+        Fp8MoEMethod.create_weights (use_mxfp8=True) allocated them; we just
+        save references so the shadow gpu_layer can rebind back to the same
+        objects across rounds of layerwise prefill.
         """
         layer = self.gpu_layer
-        # Cache the original (canonical) MXFP8 scale parameters.
         self._w13_scale_mxfp8_param = layer.w13_weight_scale_inv
         self._w2_scale_mxfp8_param = layer.w2_weight_scale_inv
-
-        device = layer.w13_weight.device
-        # w13: [E, 2I, H] fp8 -> scale [E, 2I/128, H/128] fp32
-        E13, n13, h13 = layer.w13_weight.shape
-        assert n13 % 128 == 0 and h13 % 128 == 0, (
-            f"M3 MXFP8 layerwise prefill expects 128-divisible shapes, got "
-            f"w13_weight.shape={tuple(layer.w13_weight.shape)}"
-        )
-        self._w13_scale_block_fp8 = torch.empty(
-            (E13, n13 // 128, h13 // 128), dtype=torch.float32, device=device
-        )
-        # w2: [E, H, I] fp8 -> scale [E, H/128, I/128] fp32
-        E2, h2, i2 = layer.w2_weight.shape
-        assert h2 % 128 == 0 and i2 % 128 == 0, (
-            f"M3 MXFP8 layerwise prefill expects 128-divisible shapes, got "
-            f"w2_weight.shape={tuple(layer.w2_weight.shape)}"
-        )
-        self._w2_scale_block_fp8 = torch.empty(
-            (E2, h2 // 128, i2 // 128), dtype=torch.float32, device=device
-        )
 
     def _build_layers(self, layer, init_args, global_num_experts, moe_runner_config):
         from sglang.srt.layers.moe.fused_moe_triton.layer import (
@@ -722,9 +696,8 @@ class SharedFullContext:
             # M3 MXFP8 reuses the FP8 block flat names. Byte payload is
             # MXFP8 (fp8 + uint8 ue8m0 [1,32]) — staging buffer dtype/shape
             # follow gpu_layer.w13_weight_scale_inv (uint8) so byte-copy
-            # transports the canonical layout. Convert to block-FP8 happens
-            # after byte-copy via the Triton kernel in
-            # `mxfp8_block_convert_kernel.py`.
+            # transports the canonical layout. fused_experts_mxfp8 consumes
+            # it directly; no convert step.
             return self.WEIGHT_NAMES_FP8
         if self.is_fp8_quant:
             return self.WEIGHT_NAMES_FP8
@@ -1233,103 +1206,35 @@ class SharedFullContext:
 
     def _prepare_weight_mxfp8(self, wrapper, original_layer=None, gpu_experts_mask=None,
                               logical_to_gpu_index=None):
-        """Prepare M3 MXFP8 weights for the full-GPU layerwise prefill fallback.
+        """Byte-copy M3 MXFP8 weights from CPU staging buffer to GPU for the
+        full-GPU layerwise prefill fallback.
 
-        Three-step bridge:
+        Shadow ``gpu_method`` stays in the MXFP8 view (``use_mxfp8=True``,
+        ``weight_block_size=[1, 32]``). ``Fp8MoEMethod.apply`` then routes
+        through ``get_triton_quant_info`` -> ``fused_experts_mxfp8``, which
+        consumes the uint8 ue8m0 scale directly via ``tl.dot_scaled`` — no
+        block-FP8 conversion, no precision loss.
 
-        1. Reset shadow ``gpu_method`` to MXFP8 view + rebind scale params
-           back to the canonical uint8 ue8m0 [E, N, K//32] tensors so the
-           CPU staging buffer (whose dtype was sealed at allocation time)
-           lines up with what kt-kernel C++ writes.
-
-        2. Reuse :meth:`_prepare_weight_fp8` for the byte-copy pipeline —
-           ``original_layer=None`` forces every expert through the CPU
-           pipeline (the real layer's scale is post-swizzled by
-           ``Fp8MoEMethod._process_mxfp8_moe_weights`` so the GPU-shortcut
-           direct copy would corrupt the canonical uint8 slot, ~6%
-           one-shot overhead on the fallback path).
-
-        3. Triton ``mxfp8_to_block_fp8_batched`` converts the per-expert
-           MXFP8 weights+scales to block-FP8 [128, 128] in place on
-           ``w13_weight``/``w2_weight`` and writes the new fp32 block
-           scales into pre-allocated ``_w{13,2}_scale_block_fp8`` tensors
-           (bit-equal to ``mxfp8_block_convert.py`` reference). Then
-           rebind shadow ``gpu_layer.{w13,w2}_weight_scale_inv`` to those
-           and flip ``gpu_method.use_mxfp8 = False`` + ``weight_block_size
-           = [128, 128]`` so ``Fp8MoEMethod.apply`` enters the standard
-           block-FP8 deep_gemm path on Hopper.
-
-        Next ``load()`` resets the shadow back to MXFP8 view at the
-        entry point (see :meth:`load`).
-
-        Origin: kt-sglang 耦合 (M3 MXFP8 layerwise prefill, v2 bridge).
+        Origin: kt-sglang 耦合 (M3 MXFP8 layerwise prefill, native MXFP8).
         """
-        # --- Step 1: Reset shadow to MXFP8 view ---
+        # Reset shadow to MXFP8 view (idempotent; ensures the Parameter slot
+        # points at the canonical uint8 ue8m0 tensor before byte-copy).
         self.gpu_method.use_mxfp8 = True
         self.gpu_method.weight_block_size = [1, 32]
         self.gpu_layer.w13_weight_scale_inv = self._w13_scale_mxfp8_param
         self.gpu_layer.w2_weight_scale_inv = self._w2_scale_mxfp8_param
 
-        # --- Step 2: Byte-copy via the FP8 pipeline ---
+        # Byte-copy via the FP8 pipeline (uint8 ue8m0 scale + fp8 weight
+        # both copied bytewise from kt-kernel CPU staging buffer).
         # original_layer=None disables the GPU shortcut: the real layer's
-        # w13/w2_weight_scale_inv has been mutated to swizzled / fp32-decoded
-        # form by Fp8MoEMethod._process_mxfp8_moe_weights, so the bytewise
-        # copy from `original_layer[gpu_idx]` to gpu_layer's uint8 ue8m0 slot
-        # would corrupt the canonical layout.
+        # scale slot may have been mutated by Fp8MoEMethod's post-load step
+        # on other paths; force the CPU staging route for canonical bytes.
         self._prepare_weight_fp8(
             wrapper,
             original_layer=None,
             gpu_experts_mask=None,
             logical_to_gpu_index=None,
         )
-
-        # --- Step 3: MXFP8 -> block-FP8 [128, 128] (in-place fp8 + new fp32 scales) ---
-        from sglang.srt.layers.quantization.mxfp8_block_convert_kernel import (
-            mxfp8_to_block_fp8_batched,
-        )
-        mxfp8_to_block_fp8_batched(
-            self.gpu_layer.w13_weight.data,
-            self.gpu_layer.w13_weight_scale_inv.data,
-            self._w13_scale_block_fp8,
-        )
-        mxfp8_to_block_fp8_batched(
-            self.gpu_layer.w2_weight.data,
-            self.gpu_layer.w2_weight_scale_inv.data,
-            self._w2_scale_block_fp8,
-        )
-
-        # Rebind to block-FP8 view; flip gpu_method state so apply() picks
-        # the standard block-FP8 deep_gemm path.
-        from torch.nn import Parameter
-        self.gpu_layer.w13_weight_scale_inv = Parameter(
-            self._w13_scale_block_fp8, requires_grad=False
-        )
-        self.gpu_layer.w2_weight_scale_inv = Parameter(
-            self._w2_scale_block_fp8, requires_grad=False
-        )
-        self.gpu_method.use_mxfp8 = False
-        self.gpu_method.weight_block_size = [128, 128]
-
-        # Verification log (rank 0, throttled to first 3 layers).
-        try:
-            tp_rank = get_tensor_model_parallel_rank()
-        except Exception:
-            tp_rank = -1
-        if tp_rank == 0:
-            _vc = getattr(SharedFullContext, "_mxfp8_verify_count", 0)
-            if _vc < 3:
-                SharedFullContext._mxfp8_verify_count = _vc + 1
-                _w13s = self.gpu_layer.w13_weight_scale_inv.data
-                _w13 = self.gpu_layer.w13_weight.data
-                logger.info(
-                    "M3 MXFP8 layerwise prefill prepare verify: "
-                    "block-FP8 w13_scale_inv shape=%s dtype=%s nz=%d/%d; "
-                    "w13_weight shape=%s dtype=%s nz=%d/%d",
-                    tuple(_w13s.shape), _w13s.dtype,
-                    int((_w13s != 0).sum().item()), _w13s.numel(),
-                    tuple(_w13.shape), _w13.dtype,
-                    int((_w13 != 0).sum().item()), _w13.numel(),
-                )
 
     def _prepare_weight_mxfp4(self, wrapper, original_layer=None, gpu_experts_mask=None,
                               logical_to_gpu_index=None):
