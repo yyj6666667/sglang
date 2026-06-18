@@ -1,119 +1,199 @@
-# MiniMax-M3 Support
+# Running MiniMax-M3 with SGLang and KT-Kernel
 
-SGLang supports [MiniMax-M3](https://huggingface.co/MiniMaxAI) with native MXFP8 inference on Hopper-class GPUs (H100/H20) and optional KT-Kernel offload for CPU experts (large hybrid deploys). M3 is a 230B sparse model with 60 MoE layers, 128 routed experts + 1 shared expert, sigmoid routing, and a native MXFP8 weight format.
+This tutorial demonstrates how to run MiniMax-M3 model inference using SGLang integrated with KT-Kernel for CPU-GPU heterogeneous inference. This setup enables efficient deployment of M3's 128-routed-expert sparse architecture by offloading the cold experts to CPU while keeping selected hot experts on GPU.
 
+The examples use the public model ID `MiniMaxAI/MiniMax-M3`. If you are using an internal mirror or a different snapshot (e.g. `Minimax-M3-preview`), replace only the local paths.
 
+The launch commands below target an 8-GPU TP8 server with 64 CPU inference threads and 2 CPU thread pools. Adjust `--tp-size`, `--kt-cpuinfer`, `--kt-threadpool-count`, and GPU expert counts for your hardware. A single-GPU hybrid configuration is also documented.
 
-## Installation
+## Table of Contents
+
+- [Running MiniMax-M3 with SGLang and KT-Kernel](#running-minimax-m3-with-sglang-and-kt-kernel)
+  - [Table of Contents](#table-of-contents)
+  - [Prerequisites](#prerequisites)
+  - [Step 1: Download Model Weights](#step-1-download-model-weights)
+  - [Step 2: Launch SGLang Server](#step-2-launch-sglang-server)
+    - [Hybrid (recommended): 8x H20/H100](#hybrid-recommended-8x-h20h100)
+    - [Hybrid: Single GPU](#hybrid-single-gpu)
+    - [Pure GPU: 8x H20/H100](#pure-gpu-8x-h20h100)
+  - [Step 3: Send Inference Requests](#step-3-send-inference-requests)
+    - [Option A: OpenAI-Compatible API](#option-a-openai-compatible-api)
+    - [Option B: Tool Calling](#option-b-tool-calling)
+  - [Thinking Mode](#thinking-mode)
+  - [Recommended Parameters](#recommended-parameters)
+  - [Troubleshooting](#troubleshooting)
+  - [Additional Resources](#additional-resources)
+
+## Prerequisites
+
+Before starting, ensure you have:
+
+1. **SGLang with MiniMax-M3 support**
+
+   Install from this fork's `feat/minimax-m3` branch (native MXFP8 MoE path on SM90 and the M3 tool-call / reasoning parsers):
+
+   ```bash
+   git clone https://github.com/yyj6666667/sglang.git
+   cd sglang
+   git checkout feat/minimax-m3
+   pip install -e "python[all]"
+   ```
+
+2. **KT-Kernel installed** (required for hybrid CPU offload)
+
+   ```bash
+   git clone https://github.com/kvcache-ai/ktransformers.git
+   cd ktransformers
+   git submodule update --init --recursive
+   cd kt-kernel && ./install.sh
+   ```
+
+   After installation, verify the CLI:
+
+   ```bash
+   kt version
+   ```
+
+3. **Transformers** — use the version pinned by SGLang's `python/pyproject.toml`. M3 requires `trust_remote_code` to load its custom configuration class.
+
+4. **CUDA toolkit** — CUDA 12.0+ recommended; CUDA 12.8+ for FP8 / MXFP8 deployments.
+
+5. **Hugging Face CLI** — for downloading models:
+
+   ```bash
+   pip install -U huggingface-hub
+   ```
+
+## Step 1: Download Model Weights
+
+Download the MiniMax-M3 weights from Hugging Face. M3 ships natively in MXFP8 (`fp8 e4m3 + uint8 ue8m0 1x32` scale).
 
 ```bash
-git clone https://github.com/yyj6666667/sglang.git
-cd sglang
-git checkout feat/minimax-m3
-pip install -e "python[all]"
-
-# Optional: KT-Kernel CPU offload (only needed for hybrid deploys)
-pip install kt-kernel
+hf download MiniMaxAI/MiniMax-M3 \
+  --local-dir /path/to/MiniMax-M3
 ```
 
-## Launch
+**Note:** Replace `/path/to/` with your actual storage path throughout this tutorial.
 
-### Pure GPU (Recommended — full speed)
+## Step 2: Launch SGLang Server
 
-8×H20 / H100, all experts on GPU.
+This fork's M3 path consumes the MXFP8 weights directly via Triton `tl.dot_scaled` on SM90 (Hopper / H20 / H100). No conversion to block-fp8 is performed at load time.
+
+### Hybrid (recommended): 8x H20/H100
 
 ```bash
-python3 -m sglang.launch_server \
-    --model-path /path/to/Minimax-M3-preview \
-    --tp 8 \
-    --quantization mxfp8 \
-    --moe-runner-backend triton \
-    --mem-fraction-static 0.70 \
-    --chunked-prefill-size 4096 \
-    --trust-remote-code \
-    --port 30000
+python -m sglang.launch_server \
+  --model-path /path/to/MiniMax-M3 \
+  --kt-weight-path /path/to/MiniMax-M3 \
+  --kt-method MXFP8 \
+  --kt-cpuinfer 64 \
+  --kt-threadpool-count 2 \
+  --kt-num-gpu-experts 40 \
+  --kt-gpu-prefill-token-threshold 500 \
+  --tp-size 8 \
+  --quantization mxfp8 \
+  --moe-runner-backend triton \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --mem-fraction-static 0.55 \
+  --chunked-prefill-size 8192 \
+  --cuda-graph-max-bs 1 \
+  --tool-call-parser minimax-m3 \
+  --reasoning-parser minimax-m3 \
+  --served-model-name MiniMax-M3
 ```
 
-### Hybrid (CPU expert offload)
+### Hybrid: Single GPU
 
-2× / 4× H20 / H100, most experts on CPU. Picks N hottest experts per rank to keep on GPU; rest dispatch to CPU via KT-Kernel.
+A single 96 GB Hopper card is sufficient if most routed experts stay on CPU:
 
 ```bash
-python3 -m sglang.launch_server \
-    --model-path /path/to/Minimax-M3-preview \
-    --tp 2 \
-    --quantization mxfp8 \
-    --moe-runner-backend triton \
-    --kt-weight-path /path/to/Minimax-M3-preview \
-    --kt-method MXFP8 \
-    --kt-cpuinfer 64 \
-    --kt-threadpool-count 2 \
-    --kt-num-gpu-experts 8 \
-    --kt-gpu-prefill-token-threshold 500 \
-    --mem-fraction-static 0.30 \
-    --chunked-prefill-size 4096 \
-    --trust-remote-code \
-    --port 30000
+CUDA_VISIBLE_DEVICES=0 \
+python -m sglang.launch_server \
+  --model-path /path/to/MiniMax-M3 \
+  --kt-weight-path /path/to/MiniMax-M3 \
+  --kt-method MXFP8 \
+  --kt-cpuinfer 64 \
+  --kt-threadpool-count 2 \
+  --kt-num-gpu-experts 4 \
+  --kt-gpu-prefill-token-threshold 500 \
+  --tp-size 1 \
+  --quantization mxfp8 \
+  --moe-runner-backend triton \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 4096 \
+  --cuda-graph-max-bs 1 \
+  --tool-call-parser minimax-m3 \
+  --reasoning-parser minimax-m3 \
+  --served-model-name MiniMax-M3
 ```
 
-Tuning notes:
+### Pure GPU: 8x H20/H100
 
-- `--kt-num-gpu-experts N`: experts kept on GPU per TP rank. Larger N → faster but more GPU memory. Typical 8–40.
-- `--kt-cpuinfer`: CPU worker threads for offloaded experts. Set to physical core count.
-- `--kt-threadpool-count`: NUMA pools; usually equals socket count.
-- `--kt-gpu-prefill-token-threshold T`: chunks of ≥ T tokens trigger a full-GPU prefill fallback (faster long-prompt prefill).
-
-### Function Calling / Reasoning
-
-Add these flags to either launch above to enable tool-call parsing and `<mm:think>` reasoning extraction:
+Skip KT-Kernel entirely and keep all 128 routed experts on GPU:
 
 ```bash
---tool-call-parser minimax-m3 \
---reasoning-parser minimax-m3
+python -m sglang.launch_server \
+  --model-path /path/to/MiniMax-M3 \
+  --tp-size 8 \
+  --quantization mxfp8 \
+  --moe-runner-backend triton \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --mem-fraction-static 0.70 \
+  --chunked-prefill-size 4096 \
+  --cuda-graph-max-bs 1 \
+  --tool-call-parser minimax-m3 \
+  --reasoning-parser minimax-m3 \
+  --served-model-name MiniMax-M3
 ```
 
-## Usage
+If you encounter OOM, lower `--kt-num-gpu-experts`, `--mem-fraction-static`, `--chunked-prefill-size`, or `--max-running-requests` (default high).
 
-### Chat completion
+## Step 3: Send Inference Requests
+
+Once the server is running at `http://localhost:8000`, you can interact with the model in several ways.
+
+### Option A: OpenAI-Compatible API
+
+The server exposes an OpenAI-compatible API at `http://localhost:8000/v1`.
+
+**curl example (non-streaming):**
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MiniMax-M3",
+    "messages": [{"role": "user", "content": "Solve step by step: 17 * 23"}],
+    "temperature": 0.0,
+    "max_tokens": 256
+  }'
+```
+
+**Python (OpenAI SDK):**
 
 ```python
 import openai
-client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+client = openai.Client(base_url="http://localhost:8000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
-    model="default",
-    messages=[
-        {"role": "user", "content": "What is the capital of France?"},
-    ],
+    model="MiniMax-M3",
+    messages=[{"role": "user", "content": "What is the capital of France?"}],
     temperature=0.0,
     max_tokens=64,
 )
 print(response.choices[0].message.content)
-# Paris.
 ```
 
-### Thinking mode
+### Option B: Tool Calling
 
-M3 supports request-level thinking control via `chat_template_kwargs.thinking_mode`. Three values are accepted; reasoning content (if any) is returned under `message.reasoning_content`.
-
-```python
-response = client.chat.completions.create(
-    model="default",
-    messages=[{"role": "user", "content": "What is 2+2?"}],
-    extra_body={"chat_template_kwargs": {"thinking_mode": "disabled"}},   # or "enabled" / "adaptive"
-    max_tokens=50,
-)
-print("content:",            response.choices[0].message.content)            # "4"
-print("reasoning_content:",  response.choices[0].message.reasoning_content)  # None
-```
-
-| `thinking_mode` | Behavior |
-|---|---|
-| `"enabled"` | Force chain-of-thought; `<mm:think>` start tag is prefilled by the template. |
-| `"disabled"` | Suppress thinking; closing tag prefilled. |
-| `"adaptive"` (default) | Model self-decides; detector handles emitted `<mm:think>` blocks. |
-
-### Tool calls
+M3 emits tool calls in its native `<minimax:tool_call>` XML format. The `--tool-call-parser minimax-m3` flag converts them to the OpenAI `tool_calls` array automatically.
 
 ```python
 tools = [{
@@ -130,33 +210,87 @@ tools = [{
 }]
 
 response = client.chat.completions.create(
-    model="default",
+    model="MiniMax-M3",
     messages=[{"role": "user", "content": "What's the weather in Shanghai?"}],
     tools=tools,
     tool_choice="auto",
     max_tokens=200,
 )
 print(response.choices[0].message.tool_calls)
-# [ChatCompletionMessageToolCall(
-#    function=Function(name='get_weather', arguments='{"city": "Shanghai"}'),
-#    type='function', ...)]
 ```
 
-The model emits tool calls in the native `<minimax:tool_call>` XML format; the parser converts to OpenAI `tool_calls` automatically. Structural-tag (xgrammar) constraints are not yet supported for M3 because of the XML grammar.
+## Thinking Mode
 
-## Benchmarks
+M3 supports request-level thinking control via `chat_template_kwargs.thinking_mode`. Reasoning output (if any) is returned under `message.reasoning_content`.
 
-Measured on 8×NVIDIA H20 with the configurations above. GSM8K (5-shot, temperature=0, 200 questions).
+| `thinking_mode` | Behavior |
+|---|---|
+| `"enabled"` | Force chain-of-thought; the `<mm:think>` start tag is prefilled by the template. |
+| `"disabled"` | Suppress thinking; the closing tag is prefilled. |
+| `"adaptive"` (default) | Model self-decides; detector handles emitted `<mm:think>` blocks. |
 
-| Config | TP | GPU experts | Accuracy | Decode tok/s (bs=1) |
-|---|---|---|---|---|
-| Pure GPU | 8 | 128 (all) | 87 % | ~5 |
-| Hybrid | 2 | 8 (CPU offload) | 89 % | ~19 |
+Example:
 
-Throughput dominated by 8-way TP all-reduce in the pure-GPU case (one all-reduce per attention + one per MoE down per layer × 60 layers × 2 = 120 small-message all-reduces per decode step). Scaling decode batch (`--max-running-requests`) amortizes this and gives much higher per-server tok/s.
+```python
+response = client.chat.completions.create(
+    model="MiniMax-M3",
+    messages=[{"role": "user", "content": "What is 2+2?"}],
+    extra_body={"chat_template_kwargs": {"thinking_mode": "disabled"}},
+    max_tokens=50,
+)
+# content: "4", reasoning_content: None
+```
 
-## Known Limitations
+## Recommended Parameters
 
-- xgrammar / structural-tag constraints not yet supported for M3 tool calls (model uses XML grammar).
-- KT-Kernel hybrid mode is single-node only; for multi-node hybrid, use the pure-GPU path with `--ep-size > 1` instead.
-- Cuda graph capture: `--cuda-graph-max-bs 1` is recommended for decode-only profiling; for serving raise it to your max batch size.
+**Default generation settings:**
+
+- temperature: 0.6 (chat) / 0.0 (greedy benchmark)
+- top-p: 0.95
+- max-tokens: task-dependent
+
+**KT-Kernel hybrid sizing rule-of-thumb:**
+
+| TP size | Suggested `--kt-num-gpu-experts` | Suggested `--kt-cpuinfer` | Notes |
+|---|---|---|---|
+| 1 | 2–8 | physical core count | Single 96 GB card, most experts on CPU |
+| 4 | 20–40 | physical core count | Mid-range deploy |
+| 8 | 40–60 | physical core count | Highest throughput; raise `--mem-fraction-static` |
+
+`--kt-gpu-prefill-token-threshold 500` enables layerwise full-GPU prefill fallback for prompts longer than 500 tokens; set to a larger value to disable for short workloads.
+
+## Troubleshooting
+
+**Model implementation errors**
+
+Make sure your SGLang build is on `feat/minimax-m3` and that `--trust-remote-code` is enabled.
+
+**OOM during startup or serving**
+
+Reduce one or more of:
+
+- `--kt-num-gpu-experts`
+- `--mem-fraction-static`
+- `--chunked-prefill-size`
+- `--max-running-requests`
+
+**Garbled or repetitive output**
+
+Verify both parsers are passed:
+
+```
+--tool-call-parser minimax-m3
+--reasoning-parser minimax-m3
+```
+
+Without `--reasoning-parser minimax-m3`, the answer leaks into `reasoning_content` and `content` is empty.
+
+**Requests go to the wrong port**
+
+This tutorial uses `--port 8000`. The OpenAI API base is `http://localhost:8000/v1`.
+
+## Additional Resources
+
+- [MiniMax-M3 Model Card](https://huggingface.co/MiniMaxAI/MiniMax-M3)
+- [KT-Kernel Documentation](https://github.com/kvcache-ai/ktransformers/tree/main/doc/en/kt-kernel)
+- [SGLang GitHub](https://github.com/sgl-project/sglang)
