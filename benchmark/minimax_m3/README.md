@@ -4,6 +4,8 @@ This tutorial demonstrates how to run MiniMax-M3 model inference using SGLang in
 
 The examples use the public model ID `MiniMaxAI/MiniMax-M3-MXFP8`.
 
+**Supported GPUs:** This fork's native MXFP8 kernel targets **SM90 (Hopper: H100 / H200 / H20 / H800)**. Upstream sgl-project/sglang PR #27944 targets **SM100 (Blackwell datacenter: B100 / B200 / GB200)** instead — use this fork on Hopper, upstream on Blackwell.
+
 The launch commands below target an 8-GPU TP8 server with 64 CPU inference threads and 2 CPU thread pools. Adjust `--tp-size`, `--kt-cpuinfer`, `--kt-threadpool-count`, and GPU expert counts for your hardware.
 
 ## Table of Contents
