@@ -1282,10 +1282,15 @@ def broadcast_pyobj(
         else "musa" if is_musa() and not force_cpu_device else "cpu"
     )
 
+    _bc_t0 = time.perf_counter()
     if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
+            _bc_t1 = time.perf_counter()
+            _bc_ms = (_bc_t1 - _bc_t0) * 1000
+            if _bc_ms > 5:
+                logger.info("[TRACE BCAST r=%d] SEND empty size_bc=%.1fms", rank, _bc_ms)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -1296,21 +1301,40 @@ def broadcast_pyobj(
             tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             dist.broadcast(tensor_size, src=src, group=dist_group)
+            _bc_t1 = time.perf_counter()
             dist.broadcast(tensor_data, src=src, group=dist_group)
+            _bc_t2 = time.perf_counter()
+            _bc_total = (_bc_t2 - _bc_t0) * 1000
+            if _bc_total > 5:
+                logger.info(
+                    "[TRACE BCAST r=%d] SEND size_bc=%.1fms data_bc=%.1fms bytes=%d",
+                    rank, (_bc_t1 - _bc_t0) * 1000, (_bc_t2 - _bc_t1) * 1000, size,
+                )
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long, device=device)
         dist.broadcast(tensor_size, src=src, group=dist_group)
+        _bc_t1 = time.perf_counter()
         size = tensor_size.item()
 
         if size == 0:
+            _bc_ms = (_bc_t1 - _bc_t0) * 1000
+            if _bc_ms > 5:
+                logger.info("[TRACE BCAST r=%d] RECV empty size_bc=%.1fms", rank, _bc_ms)
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.broadcast(tensor_data, src=src, group=dist_group)
+        _bc_t2 = time.perf_counter()
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
+        _bc_total = (_bc_t2 - _bc_t0) * 1000
+        if _bc_total > 5:
+            logger.info(
+                "[TRACE BCAST r=%d] RECV size_bc=%.1fms data_bc=%.1fms bytes=%d",
+                rank, (_bc_t1 - _bc_t0) * 1000, (_bc_t2 - _bc_t1) * 1000, size,
+            )
         return data
 
 

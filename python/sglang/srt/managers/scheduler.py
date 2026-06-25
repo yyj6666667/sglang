@@ -1155,47 +1155,66 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         _loop_iter = 0
+        _had_batch_last = False
 
         while True:
             _loop_iter += 1
-            _t0 = time.perf_counter()
+            _t = time.perf_counter()
 
-            # Receive requests
+            # Step 1: recv_requests
             recv_reqs = self.recv_requests()
             _t1 = time.perf_counter()
+
+            # Step 2: process_input_requests
             self.process_input_requests(recv_reqs)
+            _t2 = time.perf_counter()
+
             if self._engine_paused:
+                logger.info("[TRACE TP%d] iter=%d PAUSED", self.tp_rank, _loop_iter)
                 continue
 
-            # Get the next batch to run
+            # Step 3: get_next_batch_to_run
             batch = self.get_next_batch_to_run()
-            _t2 = time.perf_counter()
+            _t3 = time.perf_counter()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
             _binfo = "None"
             if batch:
                 _binfo = "mode=%s bs=%d" % (batch.forward_mode, batch.batch_size())
-            if batch or _loop_iter <= 3:
+
+            _should_log = (
+                batch is not None
+                or len(recv_reqs) > 0
+                or _loop_iter % 100 == 0
+                or _had_batch_last
+            )
+            if _should_log:
                 logger.info(
-                    "[TRACE TP%d] iter=%d recv=%.1fms get_batch=%.1fms batch=%s",
+                    "[TRACE TP%d] iter=%d recv=%.1fms proc=%.1fms sched=%.1fms batch=%s ovlp=%s nreq=%d",
                     self.tp_rank, _loop_iter,
-                    (_t1 - _t0) * 1000, (_t2 - _t1) * 1000, _binfo,
+                    (_t1 - _t) * 1000, (_t2 - _t1) * 1000, (_t3 - _t2) * 1000,
+                    _binfo, disable_overlap_for_batch, len(recv_reqs),
                 )
 
-            # If we do not need to overlap the current batch with the last batch,
-            # we can process the last batch immediately.
+            # Step 4: pop_and_process (if disable_overlap)
             if disable_overlap_for_batch:
+                _t4a = time.perf_counter()
                 pop_and_process()
+                logger.info(
+                    "[TRACE TP%d] iter=%d pop_process(ovlp)=%.1fms",
+                    self.tp_rank, _loop_iter, (time.perf_counter() - _t4a) * 1000,
+                )
 
             # Launch the current batch
             if batch:
-                _t3 = time.perf_counter()
+                _t5 = time.perf_counter()
                 batch_result = self.run_batch(batch)
-                _t4 = time.perf_counter()
+                _t5e = time.perf_counter()
                 self.result_queue.append((batch.copy(), batch_result))
                 logger.info(
                     "[TRACE TP%d] iter=%d run_batch=%.1fms",
-                    self.tp_rank, _loop_iter, (_t4 - _t3) * 1000,
+                    self.tp_rank, _loop_iter, (_t5e - _t5) * 1000,
                 )
             else:
                 batch_result = None
@@ -1203,17 +1222,28 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
+                    _t6 = time.perf_counter()
                     pop_and_process()
+                    logger.info(
+                        "[TRACE TP%d] iter=%d pop_process(last)=%.1fms",
+                        self.tp_rank, _loop_iter, (time.perf_counter() - _t6) * 1000,
+                    )
             elif batch is None:
-                # When the server is idle, do self-check and re-init some states
+                _t6i = time.perf_counter()
                 self.self_check_during_idle()
+                _idle_ms = (time.perf_counter() - _t6i) * 1000
+                if _idle_ms > 1.0:
+                    logger.info(
+                        "[TRACE TP%d] iter=%d idle_check=%.1fms",
+                        self.tp_rank, _loop_iter, _idle_ms,
+                    )
 
             # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
+            _had_batch_last = batch is not None
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
@@ -1331,12 +1361,19 @@ class Scheduler(
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
+            _t_pre_bcast = time.perf_counter()
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
+            _bcast_ms = (time.perf_counter() - _t_pre_bcast) * 1000
+            if recv_reqs or _bcast_ms > 5:
+                logger.info(
+                    "[TRACE RECV TP%d] bcast=%.1fms nreq=%d",
+                    self.tp_rank, _bcast_ms, len(recv_reqs),
+                )
 
         # Process MM requests under EPD-disaggregation mode
         if (
