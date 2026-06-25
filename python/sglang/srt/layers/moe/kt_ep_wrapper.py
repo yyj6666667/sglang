@@ -2907,11 +2907,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             or hasattr(layer, "w13_weight_packed")
             or getattr(layer, "_v4_tk_path", False)
         )
-        if (
+        _gpu_prefill_trigger = (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
             and _full_gpu_fallback_supported
-        ):
+        )
+        _label = "TRIGGERED" if _gpu_prefill_trigger else "SKIP"
+        logger.info(
+            "[TRACE GPU_PREFILL TP%d] layer=%d tokens=%d threshold=%d supported=%s -> %s",
+            self.tp_rank, self.kt_config.layer_idx,
+            num_tokens, self.gpu_prefill_token_threshold,
+            _full_gpu_fallback_supported, _label,
+        )
+        if _gpu_prefill_trigger:
             ctx = self._build_full_context(layer)
 
             t_compute = time.perf_counter()

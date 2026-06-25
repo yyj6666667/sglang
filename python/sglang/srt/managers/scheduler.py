@@ -1154,17 +1154,33 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        _loop_iter = 0
+
         while True:
+            _loop_iter += 1
+            _t0 = time.perf_counter()
+
             # Receive requests
             recv_reqs = self.recv_requests()
+            _t1 = time.perf_counter()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
+            _t2 = time.perf_counter()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            _binfo = "None"
+            if batch:
+                _binfo = "mode=%s bs=%d" % (batch.forward_mode, batch.batch_size())
+            if batch or _loop_iter <= 3:
+                logger.info(
+                    "[TRACE TP%d] iter=%d recv=%.1fms get_batch=%.1fms batch=%s",
+                    self.tp_rank, _loop_iter,
+                    (_t1 - _t0) * 1000, (_t2 - _t1) * 1000, _binfo,
+                )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -1173,8 +1189,14 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                _t3 = time.perf_counter()
                 batch_result = self.run_batch(batch)
+                _t4 = time.perf_counter()
                 self.result_queue.append((batch.copy(), batch_result))
+                logger.info(
+                    "[TRACE TP%d] iter=%d run_batch=%.1fms",
+                    self.tp_rank, _loop_iter, (_t4 - _t3) * 1000,
+                )
             else:
                 batch_result = None
 
