@@ -2118,6 +2118,38 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
+        _has_work = len(self.waiting_queue) > 0 or self.chunked_req is not None
+        if _has_work:
+            try:
+                _mem_avail = self.token_to_kv_pool_allocator.available_size()
+            except Exception:
+                _mem_avail = -1
+            try:
+                _req_avail = self.req_to_token_pool.available_size()
+            except Exception:
+                _req_avail = -1
+            def _safe_len(r):
+                eil = getattr(r, "extend_input_len", None)
+                if eil is not None:
+                    try:
+                        return int(eil)
+                    except Exception:
+                        pass
+                fi = getattr(r, "fill_ids", None)
+                if fi is None:
+                    return 0
+                try:
+                    return len(fi)
+                except Exception:
+                    return -1
+            _wq_info = [(getattr(r, "rid", "?")[:8], _safe_len(r))
+                        for r in self.waiting_queue]
+            logger.info(
+                "[TRACE PREFILL TP%d] entry wq=%d running_bs=%d chunked=%s batch_full=%s mem_avail=%d req_avail=%d wq=%s",
+                self.tp_rank, len(self.waiting_queue), len(self.running_batch.reqs),
+                self.chunked_req is not None, self.running_batch.batch_is_full,
+                _mem_avail, _req_avail, _wq_info,
+            )
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -2131,6 +2163,11 @@ class Scheduler(
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if _has_work:
+                logger.info(
+                    "[TRACE PREFILL TP%d] REJECT reason=EARLY_FULL_OR_EMPTY batch_full=%s wq=%d chunked=None",
+                    self.tp_rank, self.running_batch.batch_is_full, len(self.waiting_queue),
+                )
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -2152,6 +2189,11 @@ class Scheduler(
             and self.chunked_req is None
             and not self.try_preemption
         ):
+            logger.info(
+                "[TRACE PREFILL TP%d] REJECT reason=NO_ALLOC_REQ alloc=%d running_bs=%d pp_mmb=%d",
+                self.tp_rank, self.get_num_allocatable_reqs(running_bs), running_bs,
+                get_global_server_args().pp_max_micro_batch_size,
+            )
             self.running_batch.batch_is_full = True
             return None
 
@@ -2165,6 +2207,7 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
+            logger.info("[TRACE PREFILL TP%d] REJECT reason=TEST_RETRACT", self.tp_rank)
             return None
 
         # Determine chunked_prefill_size for this batch
@@ -2247,11 +2290,43 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            _add_t0 = time.perf_counter()
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if res != AddReqResult.CONTINUE:
+                try:
+                    _rem_chunk = adder.rem_chunk_tokens
+                except Exception:
+                    _rem_chunk = "?"
+                try:
+                    _rem_total = float(adder.rem_total_tokens)
+                except Exception:
+                    _rem_total = -1
+                try:
+                    _rem_swa = adder.rem_swa_tokens if adder.is_hybrid_swa else "n/a"
+                except Exception:
+                    _rem_swa = "?"
+                try:
+                    _rem_inp = adder.rem_input_tokens
+                except Exception:
+                    _rem_inp = "?"
+                _pi = getattr(req, "prefix_indices", None)
+                _pi_len = 0 if _pi is None else len(_pi)
+                _eil = getattr(req, "extend_input_len", None)
+                _eil = -1 if _eil is None else int(_eil)
+                logger.info(
+                    "[TRACE ADD TP%d] rid=%s res=%s ext_in_len=%d prefix=%d max_new=%d page=%d "
+                    "rem_chunk=%s rem_total=%.0f rem_input=%s rem_swa=%s is_swa=%s",
+                    self.tp_rank, getattr(req, "rid", "?")[:8], res.name,
+                    _eil, _pi_len,
+                    int(getattr(req.sampling_params, "max_new_tokens", -1)),
+                    adder.page_size,
+                    _rem_chunk, _rem_total, _rem_inp, _rem_swa,
+                    adder.is_hybrid_swa,
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -2270,6 +2345,11 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            if _has_work:
+                logger.info(
+                    "[TRACE PREFILL TP%d] REJECT reason=CAN_RUN_EMPTY (all reqs rejected by adder)",
+                    self.tp_rank,
+                )
             return None
 
         self.waiting_queue = [
