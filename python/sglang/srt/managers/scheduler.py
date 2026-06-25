@@ -1298,7 +1298,13 @@ class Scheduler(
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        _us_t0 = time.perf_counter()
                         recv_req = unwrap_shm_features(recv_req)
+                        _us_t1 = time.perf_counter()
+                        _rid_recv = getattr(recv_req, "rid", None) or type(recv_req).__name__
+                        logger.info("[TRACE UNSHM TP%d] rid=%s unshm_ms=%.1f cls=%s",
+                                    self.tp_rank, _rid_recv,
+                                    (_us_t1 - _us_t0) * 1000, type(recv_req).__name__)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)

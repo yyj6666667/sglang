@@ -24,6 +24,7 @@ import signal
 import socket
 import sys
 import threading
+import time as _trace_time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -500,10 +501,42 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
+                _tm_t0 = _trace_time.perf_counter()
+                _rid = getattr(obj, "rid", "?")
+                _ilen = -1
+                try:
+                    _txt = getattr(obj, "text", None)
+                    _iids = getattr(obj, "input_ids", None)
+                    if _iids is not None:
+                        _ilen = len(_iids) if hasattr(_iids, "__len__") else -1
+                    elif _txt is not None:
+                        _ilen = len(_txt) if hasattr(_txt, "__len__") else -1
+                except Exception:
+                    pass
+                logger.info("[TRACE TM IN] rid=%s input_len=%d", _rid, _ilen)
+
                 tokenized_obj = await self._tokenize_one_request(obj)
+                _tm_t1 = _trace_time.perf_counter()
+                try:
+                    _tklen = len(tokenized_obj.input_ids)
+                except Exception:
+                    _tklen = -1
+                logger.info("[TRACE TM TOK] rid=%s tokens=%d tok_ms=%.1f",
+                            _rid, _tklen, (_tm_t1 - _tm_t0) * 1000)
+
                 state = self.rid_to_state[obj.rid]
                 self._send_one_request(tokenized_obj)
+                _tm_t2 = _trace_time.perf_counter()
+                logger.info("[TRACE TM SND] rid=%s send_ms=%.1f", _rid, (_tm_t2 - _tm_t1) * 1000)
+
+                logger.info("[TRACE TM WAIT] rid=%s await_start", _rid)
+                _first_chunk = True
                 async for response in self._wait_one_response(obj, state, request):
+                    if _first_chunk:
+                        _tm_t3 = _trace_time.perf_counter()
+                        logger.info("[TRACE TM WAIT] rid=%s first_chunk_ms=%.1f",
+                                    _rid, (_tm_t3 - _tm_t2) * 1000)
+                        _first_chunk = False
                     yield response
             else:
                 async for response in self._handle_batch_request(obj, request):
@@ -1052,8 +1085,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
+        _s_t0 = _trace_time.perf_counter()
         tokenized_obj = wrap_shm_features(tokenized_obj)
+        _s_t1 = _trace_time.perf_counter()
         self.send_to_scheduler.send_pyobj(tokenized_obj)
+        _s_t2 = _trace_time.perf_counter()
+        _rid = getattr(tokenized_obj, "rid", "?")
+        logger.info("[TRACE TM ZMQ] rid=%s shm_ms=%.1f zmq_ms=%.1f",
+                    _rid, (_s_t1 - _s_t0) * 1000, (_s_t2 - _s_t1) * 1000)
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
     def _send_batch_request(

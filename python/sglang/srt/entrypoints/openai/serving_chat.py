@@ -658,6 +658,8 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
 
+        _rid_oai = getattr(adapted_request, "rid", "?")
+        logger.info("[TRACE OAI] rid=%s _generate_chat_stream entering TM.generate_request", _rid_oai)
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request

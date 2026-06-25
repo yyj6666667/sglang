@@ -1387,9 +1387,20 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
+    _h_t0 = time.perf_counter()
+    try:
+        _msg_total = sum(len(m.content or "") if hasattr(m, "content") else 0
+                         for m in (request.messages or []))
+    except Exception:
+        _msg_total = -1
+    logger.info("[TRACE HTTP] /v1/chat/completions entry stream=%s msg_chars=%d",
+                getattr(request, "stream", None), _msg_total)
+    _resp = await raw_request.app.state.openai_serving_chat.handle_request(
         request, raw_request
     )
+    logger.info("[TRACE HTTP] /v1/chat/completions handle_request_returned_ms=%.1f",
+                (time.perf_counter() - _h_t0) * 1000)
+    return _resp
 
 
 @app.post(
