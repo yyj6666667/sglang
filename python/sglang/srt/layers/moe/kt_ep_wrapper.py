@@ -25,6 +25,11 @@ Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod):
         Force GPU-experts apply() to a zero return; routed expert output
         comes purely from the CPU side. "Plan-C" fallback for diagnosing
         whether a regression sits in the GPU MoE path or the merge math.
+
+    SGLANG_KT_SKIP_IDLE_CPU_EXPERT=1
+        For eager single-token forwards, skip CPU submit/sync when every
+        selected expert is already resident on the GPU. This adds one small
+        device-to-host route check and is intended for sparse CPU spillover.
 """
 
 import copy
@@ -2937,6 +2942,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
         profile_ranges = self._decode_profile_ranges
+        cpu_path_active = self.tp_rank == 0 and self._cpu_stream is not None
+        if (
+            cpu_path_active
+            and num_tokens == 1
+            and os.environ.get("SGLANG_KT_SKIP_IDLE_CPU_EXPERT") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # With sparse CPU spillover, most decode tokens do not select a
+            # CPU expert. Avoid paying CPUInfer and TP rank-skew costs for
+            # those layers. Keep the original path for graph capture and for
+            # any layer whose top-k contains a CPU-resident expert.
+            selected_on_gpu = self.gpu_experts_mask_cuda[topk_output.topk_ids]
+            cpu_path_active = not bool(torch.all(selected_on_gpu).item())
         _kt_timing = (
             os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
             and self.tp_rank == 0
@@ -3037,7 +3055,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy
         staging_buffer = None
         with decode_profile_range(profile_ranges[1]):
-            if self.tp_rank == 0 and self._cpu_stream is not None:
+            if cpu_path_active:
                 # Use shared staging buffer (shared across all MoE layers to save GPU memory)
                 assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
                 staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
@@ -3136,7 +3154,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
         with decode_profile_range(profile_ranges[4]):
-            if self.tp_rank == 0 and self._cpu_stream is not None:
+            if cpu_path_active:
                 _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
                 from contextlib import nullcontext as _ctx_null
                 _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
@@ -3155,7 +3173,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 if not _no_cpu_stream:
                     torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
         with decode_profile_range(profile_ranges[5]):
-            if self.tp_rank == 0 and self._cpu_stream is not None:
+            if cpu_path_active:
                 output = output + cpu_output
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
