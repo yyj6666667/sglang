@@ -50,6 +50,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda
+from sglang.srt.utils.decode_profile import decode_profile_range
 
 if is_cuda():
     from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
@@ -2457,6 +2458,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         self.gpu_method = gpu_method
         self.kt_config = kt_config
+        profile_prefix = f"kt.layer.{kt_config.layer_idx:02d}"
+        self._decode_profile_ranges = tuple(
+            f"{profile_prefix}.{stage}"
+            for stage in (
+                "full_gpu",
+                "cpu_submit",
+                "mask_remap",
+                "gpu_experts",
+                "cpu_sync",
+                "merge",
+            )
+        )
         self.gpu_experts_mask = kt_config.gpu_experts_mask  # bool tensor [num_experts], on CPU
         self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
         self.kt_expert_lora_path = kt_config.expert_lora_path
@@ -2923,6 +2936,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+        profile_ranges = self._decode_profile_ranges
         _kt_timing = (
             os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
             and self.tp_rank == 0
@@ -2967,7 +2981,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 ctx.gpu_method.process_weights_after_loading(ctx.gpu_layer)
 
             t_compute = time.perf_counter()
-            result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
+            with decode_profile_range(profile_ranges[0]):
+                result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             compute_time = (time.perf_counter() - t_compute) * 1000.0
@@ -3021,26 +3036,27 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 1: Copy hidden_states to staging buffer and submit CPU computation
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy
         staging_buffer = None
-        if self.tp_rank == 0 and self._cpu_stream is not None:
-            # Use shared staging buffer (shared across all MoE layers to save GPU memory)
-            assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
-            staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
+        with decode_profile_range(profile_ranges[1]):
+            if self.tp_rank == 0 and self._cpu_stream is not None:
+                # Use shared staging buffer (shared across all MoE layers to save GPU memory)
+                assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
+                staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
 
-            # Copy to staging buffer on main stream
-            staging_buffer.copy_(x, non_blocking=True)
+                # Copy to staging buffer on main stream
+                staging_buffer.copy_(x, non_blocking=True)
 
-            # SGLANG_KT_HYBRID_NO_CPU_STREAM=1 collapses cpu_stream onto main stream.
-            _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
-            if not _no_cpu_stream:
-                # Fork to cpu_stream (waits for staging copy to complete)
-                self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
-            from contextlib import nullcontext as _ctx_null
-            _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
-            with _stream_ctx:
-                # Submit uses staging_buffer, so GPU can modify original x freely
-                self._submit_with_staged_input(
-                    layer, dispatch_output, staging_buffer
-                )
+                # SGLANG_KT_HYBRID_NO_CPU_STREAM=1 collapses cpu_stream onto main stream.
+                _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
+                if not _no_cpu_stream:
+                    # Fork to cpu_stream (waits for staging copy to complete)
+                    self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
+                from contextlib import nullcontext as _ctx_null
+                _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
+                with _stream_ctx:
+                    # Submit uses staging_buffer, so GPU can modify original x freely
+                    self._submit_with_staged_input(
+                        layer, dispatch_output, staging_buffer
+                    )
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -3048,16 +3064,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
         # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
-        topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_and_remap_expert_ids(
-            topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
-        )
+        with decode_profile_range(profile_ranges[2]):
+            topk_ids = topk_output.topk_ids
+            masked_topk_ids = mask_and_remap_expert_ids(
+                topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
+            )
 
-        # Create modified dispatch output for GPU computation
-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
-        masked_dispatch_output = dispatch_output._replace(
-            topk_output=masked_topk_output
-        )
+            # Create modified dispatch output for GPU computation
+            masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
+            masked_dispatch_output = dispatch_output._replace(
+                topk_output=masked_topk_output
+            )
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -3094,48 +3111,52 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Flash + --kt-num-gpu-experts=0), which defeats the
         # num_gpu_experts==0 short-circuit. The env var lets the operator
         # force the bypass without untangling the mask generator.
-        if self.num_gpu_experts == 0 or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1":
-            gpu_combine_input = None
-            output = torch.zeros_like(x)
-            # 2604B sub-mode adds a runtime path-checker assertion in the
-            # model (deepseek_v4.py:1169 expects observed == 1 after every
-            # MoE forward). The trtllm path bumps it inside its body; the
-            # bypass path mirrors that here so the assertion still passes
-            # when GPU MoE is short-circuited in favour of CPU experts.
-            from sglang.srt.environ import envs as _envs
-            if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-                from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-                    deepseek_v4_moe_code_path_checker,
-                )
-                deepseek_v4_moe_code_path_checker.observed += 1
-        else:
-            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
-            output = gpu_combine_input.hidden_states
+        with decode_profile_range(profile_ranges[3]):
+            if self.num_gpu_experts == 0 or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1":
+                gpu_combine_input = None
+                output = torch.zeros_like(x)
+                # 2604B sub-mode adds a runtime path-checker assertion in the
+                # model (deepseek_v4.py:1169 expects observed == 1 after every
+                # MoE forward). The trtllm path bumps it inside its body; the
+                # bypass path mirrors that here so the assertion still passes
+                # when GPU MoE is short-circuited in favour of CPU experts.
+                from sglang.srt.environ import envs as _envs
+                if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+                    from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+                        deepseek_v4_moe_code_path_checker,
+                    )
+                    deepseek_v4_moe_code_path_checker.observed += 1
+            else:
+                gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+                output = gpu_combine_input.hidden_states
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
             _kt_t_after_gpu = time.perf_counter()
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
-        if self.tp_rank == 0 and self._cpu_stream is not None:
-            _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
-            from contextlib import nullcontext as _ctx_null
-            _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
-            with _stream_ctx:
-                # Use staging_buffer for sync to get correct buffer reference
-                _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
-                cpu_output = self._sync_with_staged_input(staging_buffer)
-                if _kt_t_sync_pre is not None:
-                    _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
-                if not _no_cpu_stream:
-                    self._sync_done_event.record(self._cpu_stream)
-            if _kt_timing:
-                _kt_t_after_sync = time.perf_counter()
+        with decode_profile_range(profile_ranges[4]):
+            if self.tp_rank == 0 and self._cpu_stream is not None:
+                _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
+                from contextlib import nullcontext as _ctx_null
+                _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
+                with _stream_ctx:
+                    # Use staging_buffer for sync to get correct buffer reference
+                    _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
+                    cpu_output = self._sync_with_staged_input(staging_buffer)
+                    if _kt_t_sync_pre is not None:
+                        _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
+                    if not _no_cpu_stream:
+                        self._sync_done_event.record(self._cpu_stream)
+                if _kt_timing:
+                    _kt_t_after_sync = time.perf_counter()
 
-            # Main stream waits for cpu_stream to complete before merging results
-            if not _no_cpu_stream:
-                torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
-            output = output + cpu_output
+                # Main stream waits for cpu_stream to complete before merging results
+                if not _no_cpu_stream:
+                    torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
+        with decode_profile_range(profile_ranges[5]):
+            if self.tp_rank == 0 and self._cpu_stream is not None:
+                output = output + cpu_output
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
             # Optional: synchronize GPU at end of apply() to capture true GPU

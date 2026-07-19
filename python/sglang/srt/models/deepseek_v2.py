@@ -160,6 +160,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.decode_profile import decode_profile_range
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -1427,6 +1428,11 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
+        attention_prefix = f"layer.{layer_id:02d}.attention"
+        self._decode_profile_ranges = (
+            f"{attention_prefix}.prepare",
+            f"{attention_prefix}.core",
+        )
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -1750,14 +1756,16 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-            llama_4_scaling=llama_4_scaling,
-        )
-        return self.forward_core(s)
+        with decode_profile_range(self._decode_profile_ranges[0], forward_batch):
+            s = self.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                llama_4_scaling=llama_4_scaling,
+            )
+        with decode_profile_range(self._decode_profile_ranges[1], forward_batch):
+            return self.forward_core(s)
 
     def forward_prepare(
         self,
@@ -2659,6 +2667,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         self.layer_id = layer_id
+        profile_prefix = f"layer.{layer_id:02d}"
+        self._decode_profile_ranges = (
+            f"{profile_prefix}.comm_pre_attention",
+            f"{profile_prefix}.comm_pre_moe",
+            f"{profile_prefix}.moe",
+            f"{profile_prefix}.comm_post",
+        )
         self.is_nextn = is_nextn
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
@@ -2790,12 +2805,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            quant_format,
-        )
+        with decode_profile_range(self._decode_profile_ranges[0], forward_batch):
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+                quant_format,
+            )
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -2805,9 +2821,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             llama_4_scaling=llama_4_scaling,
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        with decode_profile_range(self._decode_profile_ranges[1], forward_batch):
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2823,21 +2840,23 @@ class DeepseekV2DecoderLayer(nn.Module):
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
-        hidden_states = self.mlp(
-            hidden_states,
-            forward_batch,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-            gemm_output_zero_allocator,
-        )
+        with decode_profile_range(self._decode_profile_ranges[2], forward_batch):
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+            )
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
 
         if not should_allreduce_fusion:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+            with decode_profile_range(self._decode_profile_ranges[3], forward_batch):
+                hidden_states, residual = self.layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
 
         return hidden_states, residual
 
@@ -3036,6 +3055,9 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
+        self._decode_layer_profile_names = [
+            f"layer.{i:02d}.total" for i in range(config.num_hidden_layers)
+        ]
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             self.enable_a2a_moe = True
         else:
@@ -3133,15 +3155,18 @@ class DeepseekV2Model(nn.Module):
                     else:
                         aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    zero_allocator,
-                    gemm_output_zero_allocator,
-                    llama_4_scaling,
-                )
+                with decode_profile_range(
+                    self._decode_layer_profile_names[i], forward_batch
+                ):
+                    hidden_states, residual = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        llama_4_scaling,
+                    )
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -3381,18 +3406,24 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     forward_batch.seq_lens_cpu.tolist(),
                 )
 
-        with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = self.model(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
-            )
+        with decode_profile_range("transformer", forward_batch):
+            with get_attn_tp_context().maybe_input_scattered(forward_batch):
+                hidden_states = self.model(
+                    input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+                )
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
+            with decode_profile_range("logits", forward_batch):
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
         else:
             return hidden_states
 

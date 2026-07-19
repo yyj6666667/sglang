@@ -172,6 +172,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.decode_profile import decode_profile_range
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
@@ -2348,22 +2349,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if not skip_attn_backend_init:
-            if self.server_args.enable_pdmux:
-                self.decode_attn_backend.init_forward_metadata(forward_batch)
-                forward_batch.attn_backend = self.decode_attn_backend
-            else:
-                self.attn_backend.init_forward_metadata(forward_batch)
+        with decode_profile_range("model_runner.metadata", forward_batch):
+            if not skip_attn_backend_init:
+                if self.server_args.enable_pdmux:
+                    self.decode_attn_backend.init_forward_metadata(forward_batch)
+                    forward_batch.attn_backend = self.decode_attn_backend
+                else:
+                    self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
-        )
+        with decode_profile_range("model_runner.model_forward", forward_batch):
+            return self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
 
     def forward_extend(
         self,
@@ -2544,11 +2547,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
         if can_run_graph:
-            ret = self.graph_runner.replay(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            with decode_profile_range("model_runner.graph_replay", forward_batch):
+                ret = self.graph_runner.replay(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
@@ -2632,21 +2636,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 axis=-1,
             )
 
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
-        # Sample the next tokens
-        next_token_ids = self.sampler(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.return_logprob,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-            # For prefill, we only use the position of the last token.
-            (
-                forward_batch.positions
-                if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
-            ),
-        )
+        with decode_profile_range("sampling.preprocess", forward_batch):
+            self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        with decode_profile_range("sampling.sample", forward_batch):
+            next_token_ids = self.sampler(
+                logits_output,
+                forward_batch.sampling_info,
+                forward_batch.return_logprob,
+                forward_batch.top_logprobs_nums,
+                forward_batch.token_ids_logprobs,
+                # For prefill, we only use the position of the last token.
+                (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else forward_batch.seq_lens - 1
+                ),
+            )
 
 
         return next_token_ids
