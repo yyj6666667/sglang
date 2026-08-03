@@ -123,7 +123,9 @@ class Fp8Config(QuantizationConfig):
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
         use_mxfp8: bool = False,
+        is_fp4_experts: bool = False,
     ) -> None:
+        self.is_fp4_experts = is_fp4_experts
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -209,8 +211,6 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            from sglang.srt.environ import envs
-
             fp8_method = Fp8MoEMethod(self)
 
             # --- Ampere / pre-Ada Marlin routing (standard FP8 only) ---
@@ -222,27 +222,18 @@ class Fp8Config(QuantizationConfig):
             # DeepSeekMxfp4MoEMethod (mxfp4_deepseek.py) which creates
             # int8 tensors and works on Ampere out of the box — do NOT
             # intercept its path.
-            if (
-                _is_cuda and not _is_hip
-                and not (
-                    envs.SGLANG_DSV4_MODE.get() == "2604"
-                    and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-                )
-            ):
+            if _is_cuda and not _is_hip and not self.is_fp4_experts:
                 major, minor = get_device_capability()
                 sm = major * 10 + minor
                 if sm < 89:  # Ampere / pre-Ada: no native FP8 hardware
                     from sglang.srt.layers.quantization.fp8_marlin_moe import (
                         Fp8MarlinMoEMethod,
                     )
+
                     return Fp8MarlinMoEMethod(fp8_method, prefix=prefix)
             # --- End Ampere Marlin routing ---
 
-            if (
-                envs.SGLANG_DSV4_MODE.get() == "2604"
-                and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-                and get_moe_runner_backend().is_flashinfer_mxfp4()
-            ):
+            if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
                 from sglang.srt.layers.quantization.mxfp4_deepseek import (
                     DeepSeekMxfp4MoEMethod,
                 )
@@ -802,9 +793,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and not self.use_mxfp8_native_sm90
         )
         self.weight_block_size = self.quant_config.weight_block_size
-        self.is_fp4_expert = (
-            envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        )
+        self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
@@ -1174,7 +1163,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 if (
                     envs.SGLANG_OPT_DEEPGEMM_SCALE_CONVERT_AT_INIT.get()
-                    and envs.SGLANG_DSV4_MODE.get() == "2604"
                     and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
                     and will_use_deepgemm
                 ):
@@ -1745,6 +1733,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
+                is_fp4_experts=self.is_fp4_expert,
             )
         elif self.runner.runner_backend.is_flashinfer_trtllm():
             # FlashInfer TRT-LLM backend only supports fused execution and consumes

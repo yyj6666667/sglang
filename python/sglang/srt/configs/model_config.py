@@ -208,8 +208,8 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
-        # Auto-detect FP4 vs FP8 routed-expert storage for DeepseekV4 2604 mode
-        self._maybe_auto_set_dsv4_fp4_experts()
+        # Resolve DSV4 layout and routed-expert storage from checkpoint data.
+        self._set_dsv4_model_traits()
 
         # Check model type
         self.attention_chunk_size = getattr(
@@ -397,14 +397,16 @@ class ModelConfig:
             self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
-    def _maybe_auto_set_dsv4_fp4_experts(self):
-        # Delegate to DSV4-only helper module so the safetensors-probing logic
-        # isn't loaded for non-DSV4 models.
+    def _set_dsv4_model_traits(self):
+        # Keep DSV4-only config and safetensors probing logic out of the common
+        # import path for non-DSV4 models.
         from sglang.srt.configs._model_config_dsv4 import (
-            maybe_auto_set_dsv4_fp4_experts,
+            detect_dsv4_fp4_experts,
+            is_deepseek_v4_flash_config,
         )
 
-        maybe_auto_set_dsv4_fp4_experts(self)
+        self.is_deepseek_v4_flash = is_deepseek_v4_flash_config(self.hf_config)
+        self.is_fp4_experts = detect_dsv4_fp4_experts(self)
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
@@ -541,14 +543,14 @@ class ModelConfig:
             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            if envs.SGLANG_DSV4_MODE.get() == "2604":
+            if self.is_deepseek_v4_flash:
                 self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
                 self.window_size = self.hf_config.sliding_window
             else:
                 self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
                 self.window_size = self.hf_config.window_size
             self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-            if envs.SGLANG_DSV4_MODE.get() == "2604":
+            if self.is_deepseek_v4_flash:
                 self.v_head_dim = self.head_dim
             self.index_head_dim = self.hf_config.index_head_dim
             self.compress_ratios = self.hf_config.compress_ratios
@@ -649,7 +651,7 @@ class ModelConfig:
             self.hidden_size * hc_mult
             if hc_mult > 1
             and envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
+            and self.is_deepseek_v4_flash
             else self.hidden_size
         )
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers

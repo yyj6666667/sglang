@@ -184,12 +184,6 @@ class DeepSeekMxfp4MoEMethod:
         self.moe_runner_config = moe_runner_config
 
         swiglu_limit = moe_runner_config.swiglu_limit
-        is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
-        assert is_2604b == (swiglu_limit is not None), (
-            f"swiglu_limit must be non-None iff submode=2604B "
-            f"(got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, "
-            f"swiglu_limit={swiglu_limit!r})"
-        )
         self._gemm1_clamp_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),
@@ -557,9 +551,7 @@ class DeepSeekMxfp4MoEMethod:
                 routed_scaling_factor=routed_scale,
                 swiglu_limit=swiglu_limit,
             )
-            if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" and (
-                self._gemm1_clamp_limit_tensor is not None
-            ):
+            if self._gemm1_clamp_limit_tensor is not None:
                 deepseek_v4_moe_code_path_checker.observed += 1
             return StandardCombineInput(hidden_states=output)
 
@@ -592,11 +584,10 @@ class DeepSeekMxfp4MoEMethod:
                     topk_ids,
                 )
             rsf = layer.moe_runner_config.routed_scaling_factor
-            # 2604B SwiGLU clamp: thread swiglu_limit through so the triton-
+            # Checkpoint SwiGLU clamp: thread swiglu_limit through so the triton-
             # kernels GPU MoE path applies the same gate/up clamp as
             # trtllm's gemm1_clamp_limit and deep_gemm's _apply_swiglu_limit.
-            # When submode != 2604B, moe_runner_config.swiglu_limit is None
-            # and apply_v4_triton_kernels_moe skips the clamp.
+            # When the config has no swiglu_limit, the kernel skips the clamp.
             # Origin: sglang 本身.
             output = apply_v4_triton_kernels_moe(
                 hidden_states=hidden_states,
@@ -616,9 +607,7 @@ class DeepSeekMxfp4MoEMethod:
             if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
                 if rsf is not None and rsf != 1.0:
                     output.mul_(rsf)
-            if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" and (
-                self._gemm1_clamp_limit_tensor is not None
-            ):
+            if self._gemm1_clamp_limit_tensor is not None:
                 deepseek_v4_moe_code_path_checker.observed += 1
             return StandardCombineInput(hidden_states=output)
 
@@ -692,9 +681,7 @@ class DeepSeekMxfp4MoEMethod:
                 num_tokens, out_hidden_size, dtype=torch.bfloat16, device=x_quant.device
             )
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" and (
-            self._gemm1_clamp_limit_tensor is not None
-        ):
+        if self._gemm1_clamp_limit_tensor is not None:
             deepseek_v4_moe_code_path_checker.observed += 1
 
         output = trtllm_fp4_block_scale_routed_moe(

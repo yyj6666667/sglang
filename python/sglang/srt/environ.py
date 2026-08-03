@@ -490,9 +490,7 @@ class Envs:
     # Accepts "", "max", "high" (empty string means unset). Other values filtered to None.
     SGLANG_REASONING_EFFORT = EnvStr("")
 
-    SGLANG_DSV4_MODE = EnvStr("")
-    SGLANG_DSV4_2604_SUBMODE = EnvStr("")
-    SGLANG_DSV4_FP4_EXPERTS = EnvBool(False)  # Set False when using FP4-to-FP8 converted checkpoint with 2604 config
+    SGLANG_DSV4_FP4_EXPERTS = EnvBool(False)  # Override routed-expert FP4 detection
     SGLANG_OPT_HISPARSE_C4_SHRINK = EnvInt(1)
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(False)

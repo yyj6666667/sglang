@@ -3617,7 +3617,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 if _kt_swiglu_limit != 0.0:
                     raise ValueError(
                         "--kt-expert-lora-path uses KT SFT wrappers, which do not "
-                        "support the V4-2604B swiglu_limit path."
+                        "support the checkpoint SwiGLU clamp path."
                     )
                 self.kt_expert_lora_weights = _load_kt_expert_lora_weights(
                     adapter_path=self.kt_expert_lora_path,
@@ -4119,16 +4119,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.num_gpu_experts == 0 or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1":
             gpu_combine_input = None
             output = torch.zeros_like(x)
-            # 2604B sub-mode adds a runtime path-checker assertion in the
-            # model (deepseek_v4.py:1169 expects observed == 1 after every
+            # A configured DSV4 SwiGLU clamp adds a runtime path-checker
+            # assertion in the model (deepseek_v4.py expects observed == 1 after every
             # MoE forward). The trtllm path bumps it inside its body; the
             # bypass path mirrors that here so the assertion still passes
             # when GPU MoE is short-circuited in favour of CPU experts.
-            from sglang.srt.environ import envs as _envs
-            if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+            _mrc = getattr(layer, "moe_runner_config", None)
+            if getattr(_mrc, "swiglu_limit", None) is not None:
                 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
                     deepseek_v4_moe_code_path_checker,
                 )
+
                 deepseek_v4_moe_code_path_checker.observed += 1
         else:
             gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)

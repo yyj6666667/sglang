@@ -34,11 +34,14 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_maybe_tbo,
 )
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.configs._model_config_dsv4 import (
+    has_deepseek_v4_swiglu_clamp,
+    is_deepseek_v4_flash_config,
+)
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
     get_nsa_index_topk,
-    is_deepseek_compressed,
     is_deepseek_nsa,
 )
 from sglang.srt.distributed import (
@@ -452,12 +455,8 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
 
-        # Gate on the model actually being DSV4-compressed: SGLANG_DSV4_MODE may
-        # be set in the operator's shell from a previous DSV4 launch and leak
-        # into non-DSV4 startups (e.g. GLM-5.1 inheriting DeepseekV2MoE), where
-        # `config.num_hash_layers` doesn't exist on the non-DSV4 config class.
-        if envs.SGLANG_DSV4_MODE.get() == "2604" and is_deepseek_compressed(config):
-            n_hash_layers = config.num_hash_layers
+        if is_deepseek_v4_flash_config(config):
+            n_hash_layers = getattr(config, "num_hash_layers", 0)
         else:
             n_hash_layers = getattr(config, "n_hash_layers", 0)
         self.is_hash = self._compute_is_hash(layer_id, n_hash_layers, is_nextn)
@@ -547,6 +546,7 @@ class DeepseekV2MoE(nn.Module):
                     and (not get_moe_runner_backend().is_flashinfer_trtllm())
                     else None
                 ),
+                is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             )
 
         self.shared_experts_is_int8 = False
@@ -637,7 +637,7 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+        if has_deepseek_v4_swiglu_clamp(config):
             assert hasattr(self, "shared_experts")
 
     def get_moe_weights(self):

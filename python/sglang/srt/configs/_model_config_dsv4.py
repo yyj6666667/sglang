@@ -1,9 +1,7 @@
-"""DSV4-specific helpers extracted from configs/model_config.py.
+"""DSV4 config traits and routed-expert checkpoint detection.
 
-The big DSV4 additions to ModelConfig.__init__ (probe-FP4-vs-FP8 logic +
-the safetensors header probe) live here. Imported lazily by
-ModelConfig._maybe_auto_set_dsv4_fp4_experts so non-DSV4 models don't
-load this code.
+Imported lazily by :meth:`ModelConfig._set_dsv4_model_traits` so non-DSV4
+models do not load the safetensors probing path.
 """
 
 from __future__ import annotations
@@ -14,7 +12,7 @@ import os
 import re
 import struct
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -22,8 +20,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_DSV4_ARCHITECTURES = {
+    "DeepseekV4ForCausalLM",
+    "DeepseekV4ForCausalLMNextN",
+}
+
+
+def is_deepseek_v4_config(config: Any) -> bool:
+    architectures = getattr(config, "architectures", None) or []
+    return bool(architectures and architectures[0] in _DSV4_ARCHITECTURES)
+
+
+def is_deepseek_v4_flash_config(config: Any) -> bool:
+    """Return whether *config* uses the V4-Flash checkpoint layout.
+
+    V4-Flash checkpoints carry ``head_dim`` and ``sliding_window`` while the
+    earlier V4 layout carries ``qk_nope_head_dim``/``v_head_dim`` and
+    ``window_size``.  Requiring the two Flash markers together prevents a
+    partially overridden config from silently selecting the wrong layout.
+    """
+    if not is_deepseek_v4_config(config):
+        return False
+
+    has_head_dim = getattr(config, "head_dim", None) is not None
+    has_sliding_window = getattr(config, "sliding_window", None) is not None
+    if has_head_dim != has_sliding_window:
+        raise ValueError(
+            "Invalid DeepSeek V4 config: head_dim and sliding_window must be "
+            "provided together for the V4-Flash layout."
+        )
+    return has_head_dim
+
+
+def has_deepseek_v4_swiglu_clamp(config: Any) -> bool:
+    return (
+        is_deepseek_v4_config(config)
+        and getattr(config, "swiglu_limit", None) is not None
+    )
+
+
 # Matches routed-expert weight keys in both HF-style layouts
-# (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepseekV4 2604-style
+# (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and V4-Flash-style
 # layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
 # excluded because the index segment requires a digit after ``.experts.``.
 _ROUTED_EXPERT_KEY_RE = re.compile(
@@ -76,47 +113,58 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
     return None
 
 
-def maybe_auto_set_dsv4_fp4_experts(model_config: "ModelConfig") -> None:
-    """Auto-set SGLANG_DSV4_FP4_EXPERTS based on the checkpoint's routed-expert
-    weight dtype for DeepseekV4 in 2604 mode. See ModelConfig wrapper docstring
-    for semantics.
+def detect_dsv4_fp4_experts(model_config: "ModelConfig") -> bool:
+    """Resolve the routed-expert layout once for this model instance.
+
+    An explicit ``SGLANG_DSV4_FP4_EXPERTS`` remains a compatibility override.
+    Otherwise the local safetensors header is probed without mutating process
+    environment state.  Non-V4-Flash models always return ``False``.
     """
-    from sglang.srt.configs.model_config import is_deepseek_compressed
     from sglang.srt.environ import envs
 
+    if not is_deepseek_v4_flash_config(model_config.hf_config):
+        return False
     if envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
-        return
-    if not is_deepseek_compressed(model_config.hf_config):
-        return
-    if envs.SGLANG_DSV4_MODE.get() != "2604":
-        return
+        return envs.SGLANG_DSV4_FP4_EXPERTS.get()
+
+    model_path = model_config.model_path
+    if not os.path.isdir(model_path):
+        try:
+            from sglang.srt.utils import find_local_repo_dir
+
+            model_path = (
+                find_local_repo_dir(model_path, revision=model_config.revision)
+                or model_path
+            )
+        except Exception:
+            pass
+
     try:
-        dtype = probe_routed_expert_weight_dtype(model_config.model_path)
+        dtype = probe_routed_expert_weight_dtype(model_path)
     except Exception as e:
         logger.warning(
             "Failed to probe routed-expert dtype for %s; keeping "
             "SGLANG_DSV4_FP4_EXPERTS default. Reason: %s",
-            model_config.model_path,
+            model_path,
             e,
         )
-        return
+        return envs.SGLANG_DSV4_FP4_EXPERTS.get()
     if dtype is None:
-        return
+        return envs.SGLANG_DSV4_FP4_EXPERTS.get()
     if dtype in ("U8", "I8", "F4"):
         is_fp4_experts = True
     elif dtype == "F8_E4M3":
         is_fp4_experts = False
     else:
         logger.warning(
-            "Unexpected routed-expert safetensors dtype=%s for 2604 mode; "
+            "Unexpected routed-expert safetensors dtype=%s for V4-Flash; "
             "keeping SGLANG_DSV4_FP4_EXPERTS default.",
             dtype,
         )
-        return
-    envs.SGLANG_DSV4_FP4_EXPERTS.set(is_fp4_experts)
+        return envs.SGLANG_DSV4_FP4_EXPERTS.get()
     logger.info(
-        "Auto-detected routed-expert safetensors dtype=%s; "
-        "SGLANG_DSV4_FP4_EXPERTS=%s",
+        "Auto-detected routed-expert safetensors dtype=%s; is_fp4_experts=%s",
         dtype,
         is_fp4_experts,
     )
+    return is_fp4_experts

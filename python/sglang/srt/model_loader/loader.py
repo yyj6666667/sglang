@@ -226,6 +226,12 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        # Carry the per-model DSV4 routed-expert layout into downstream MoE
+        # components instead of consulting process-global mode state.
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        if isinstance(quant_config, Fp8Config):
+            quant_config.is_fp4_experts = getattr(model_config, "is_fp4_experts", False)
         if not _is_npu:
             major, minor = get_device_capability()
 

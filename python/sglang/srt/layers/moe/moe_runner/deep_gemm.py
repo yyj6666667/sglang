@@ -112,6 +112,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    is_fp4_experts: bool = False
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -167,6 +168,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         K = hidden_states_shape[1]
         scale_block_size = 128
 
+        recipe_a, recipe_b = (
+            ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
+        )
+
         w13_weight_fp8 = (
             quant_info.w13_weight,
             quant_info.w13_scale,
@@ -185,16 +190,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w13_weight_fp8,
             gateup_output,
             m_indices,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-            is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
-            swiglu_limit_arg: Optional[float] = None
-            if is_2604b:
-                swiglu_limit_arg = self.swiglu_limit
+            swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
                 (all_tokens, N // 2),
@@ -228,7 +232,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 sglang_per_token_group_quant_fp8,
             )
 
-            if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+            if self.swiglu_limit is not None:
                 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
                     deepseek_v4_moe_code_path_checker,
                 )
@@ -268,6 +272,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w2_weight_fp8,
             down_output,
             m_indices,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
 
         return down_output
@@ -289,6 +295,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w2_weight = quant_info.w2_weight
         w13_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
+
+        recipe_a, recipe_b = (
+            ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
+        )
 
         hidden_states_device = running_state["hidden_states_device"]
 
@@ -318,22 +328,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gateup_output,
             masked_m,
             expected_m,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
-        assert is_2604b == (
-            self.swiglu_limit is not None
-        ), f"swiglu_limit must be non-None iff submode=2604B (got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, swiglu_limit={self.swiglu_limit!r})"
         swiglu_limit_arg: Optional[float] = None
-        if is_2604b:
+        if self.swiglu_limit is not None:
             assert (
                 not _MASKED_GEMM_FAST_ACT
-            ), "DSV4 2604 submode 2604B does not support SGLANG_MASKED_GEMM_FAST_ACT"
+            ), "DeepSeek V4 SwiGLU clamp does not support SGLANG_MASKED_GEMM_FAST_ACT"
             assert (
                 envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            ), "DSV4 2604 submode 2604B requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+            ), "DeepSeek V4 SwiGLU clamp requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
 
             if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
                 swiglu_limit_arg = self.swiglu_limit
@@ -395,6 +403,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_output,
             masked_m,
             expected_m,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
             **gemm_overlap_args_dict,
         )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
@@ -685,7 +695,7 @@ def _varlen_deep_gemm_silu_mul_quant(
         )
         assert (
             swiglu_limit is None
-        ), "swiglu_limit (DSV4 2604 submode 2604B) is not supported together with SGLANG_MASKED_GEMM_FAST_ACT"
+        ), "Checkpoint SwiGLU clamp is incompatible with SGLANG_MASKED_GEMM_FAST_ACT"
         return sglang_per_token_group_quant_8bit(
             x=gateup_output,
             dst_dtype=torch.float8_e4m3fn,
@@ -737,7 +747,7 @@ def _varlen_deep_gemm_silu_mul_quant(
     else:
         assert (
             swiglu_limit is None
-        ), "swiglu_limit (DSV4 2604 submode 2604B) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        ), "Checkpoint SwiGLU clamp requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
         assert (
             not swizzle
         ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"

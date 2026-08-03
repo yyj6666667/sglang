@@ -1,4 +1,3 @@
-
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -7,6 +6,10 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs._model_config_dsv4 import (
+    has_deepseek_v4_swiglu_clamp,
+    is_deepseek_v4_flash_config,
+)
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -43,6 +46,7 @@ class DeepseekV4ModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.is_deepseek_v4_flash = is_deepseek_v4_flash_config(config)
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -130,10 +134,7 @@ class DeepseekV4ModelNextN(nn.Module):
             hidden_states = input_embeds
 
         if hidden_states.shape[0] > 0:
-            if (
-                envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-                and envs.SGLANG_DSV4_MODE.get() == "2604"
-            ):
+            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get() and self.is_deepseek_v4_flash:
                 n_tokens = hidden_states.shape[0]
                 d = self.config.hidden_size
                 hc_flat = forward_batch.spec_info.hidden_states.view(
@@ -175,8 +176,7 @@ class DeepseekV4ModelNextN(nn.Module):
 
         pre_hc_head = (
             hidden_states.flatten(1)
-            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
+            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get() and self.is_deepseek_v4_flash
             else None
         )
 
@@ -203,6 +203,9 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
+        self.is_deepseek_v4_flash = is_deepseek_v4_flash_config(config)
+        self.has_swiglu_clamp = has_deepseek_v4_swiglu_clamp(config)
+        self.is_fp4_experts = getattr(quant_config, "is_fp4_experts", False)
         self.determine_num_fused_shared_experts()
 
         self.model = DeepseekV4ModelNextN(
@@ -226,10 +229,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
     ) -> torch.Tensor:
         result = self.model(input_ids, positions, forward_batch)
         pre_hc_head = None
-        if (
-            envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-        ):
+        if envs.SGLANG_FIX_MTP_HC_HIDDEN.get() and self.is_deepseek_v4_flash:
             hidden_states, pre_hc_head = result
         else:
             hidden_states = result

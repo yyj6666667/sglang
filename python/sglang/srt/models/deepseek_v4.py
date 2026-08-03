@@ -48,6 +48,10 @@ _try_side_effect("sglang.srt.layers.moe.kt_ep_wrapper")
 _try_side_effect("sglang.srt.managers.hisparse_coordinator")
 _try_side_effect("sglang.srt.mem_cache.deepseekv4_memory_pool")
 from sglang.jit_kernel.deepseek_v4 import fused_rope, linear_bf16_fp32, rmsnorm_self
+from sglang.srt.configs._model_config_dsv4 import (
+    has_deepseek_v4_swiglu_clamp,
+    is_deepseek_v4_flash_config,
+)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 
 # Register DSV4 config with HF AutoConfig as a side-effect of loading the
@@ -235,6 +239,7 @@ class Compressor(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.is_deepseek_v4_flash = is_deepseek_v4_flash_config(config)
         self.layer_id = layer_id
         self.is_in_indexer = is_in_indexer
         self.dim = config.hidden_size
@@ -269,9 +274,10 @@ class Compressor(nn.Module):
         assert not self.ape_converted
         self.ape_converted = True
 
-        is_model_2604 = envs.SGLANG_DSV4_MODE.get() == "2604"
-        if self.overlap and (envs.SGLANG_OPT_FIX_APE_2604.get() or not is_model_2604):
-            orders = [0, 1] if is_model_2604 else [1, 0]
+        if self.overlap and (
+            envs.SGLANG_OPT_FIX_APE_2604.get() or not self.is_deepseek_v4_flash
+        ):
+            orders = [0, 1] if self.is_deepseek_v4_flash else [1, 0]
             ape = torch.chunk(self.ape.data, 2, dim=-1)
             ape = torch.cat([ape[orders[0]], ape[orders[1]]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
@@ -476,7 +482,9 @@ class MQALayer(nn.Module):
         self.layer_id = layer_id
         self.dim = config.hidden_size
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
+        self.is_deepseek_v4_flash = is_deepseek_v4_flash_config(config)
+        self.has_swiglu_clamp = has_deepseek_v4_swiglu_clamp(config)
+        if self.is_deepseek_v4_flash:
             self.qk_nope_head_dim = config.head_dim - config.qk_rope_head_dim
         else:
             self.qk_nope_head_dim = config.qk_nope_head_dim
@@ -499,7 +507,7 @@ class MQALayer(nn.Module):
         assert compress_ratio in [0, 4, 128]
         self.compress_ratio: Literal[0, 4, 128] = compress_ratio
 
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
+        if self.is_deepseek_v4_flash:
             assert self.head_dim == config.head_dim
         else:
             assert self.head_dim == config.v_head_dim
@@ -529,16 +537,14 @@ class MQALayer(nn.Module):
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
+        if self.is_deepseek_v4_flash:
             if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get():
                 assert rope_scaling["factor"] == 16
-        elif envs.SGLANG_DSV4_MODE.get() == "2601":
+        else:
             if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get():
                 assert rope_scaling["factor"] == 4
-        else:
-            raise NotImplementedError
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+        if self.has_swiglu_clamp:
             assert self.compress_ratio in {0, 4, 128}
             if self.compress_ratio:
                 original_seq_len = rope_scaling["original_max_position_embeddings"]
@@ -990,6 +996,8 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.is_deepseek_v4_flash = is_deepseek_v4_flash_config(config)
+        self.has_swiglu_clamp = has_deepseek_v4_swiglu_clamp(config)
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         self.is_nextn = is_nextn
@@ -1040,7 +1048,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
+        if self.is_deepseek_v4_flash:
             first_k_dense_replace = 0
             moe_layer_freq = 1
         else:
@@ -1163,7 +1171,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+        if self.has_swiglu_clamp:
             assert deepseek_v4_moe_code_path_checker.observed == 0
 
         residual = hidden_states
@@ -1233,7 +1241,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+        if self.has_swiglu_clamp:
             assert deepseek_v4_moe_code_path_checker.observed == 1
             deepseek_v4_moe_code_path_checker.observed = 0
 
@@ -1250,6 +1258,7 @@ class DeepseekV4Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.is_deepseek_v4_flash = is_deepseek_v4_flash_config(config)
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
@@ -1407,8 +1416,7 @@ class DeepseekV4Model(nn.Module):
 
         pre_hc_head = (
             hidden_states.flatten(1)
-            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
+            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get() and self.is_deepseek_v4_flash
             else None
         )
 
@@ -1433,6 +1441,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.is_deepseek_v4_flash = is_deepseek_v4_flash_config(config)
+        self.has_swiglu_clamp = has_deepseek_v4_swiglu_clamp(config)
+        self.is_fp4_experts = getattr(quant_config, "is_fp4_experts", False)
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -1492,13 +1503,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
-        elif (
-            envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        ):
-            disable_reason = "2604 routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
+        elif self.is_fp4_experts:
+            disable_reason = "Routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            disable_reason = "2604B checkpoint requires different clamping for shared and routed experts"
+        if self.has_swiglu_clamp:
+            disable_reason = "The checkpoint requires different clamping for shared and routed experts"
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
@@ -1537,10 +1546,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         pre_hc_head = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
-        if (
-            envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-        ):
+        if envs.SGLANG_FIX_MTP_HC_HIDDEN.get() and self.is_deepseek_v4_flash:
             hidden_states, pre_hc_head = hidden_states
         return self.logits_processor(
             input_ids,
@@ -1653,16 +1659,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        assert envs.SGLANG_DSV4_MODE.get() in ["2601", "2604"]
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            assert envs.SGLANG_DSV4_2604_SUBMODE.get() in ["2604A", "2604B"]
-        else:
-            assert envs.SGLANG_DSV4_2604_SUBMODE.get() == ""
-
-        if (
-            envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-        ):
+        if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and self.is_deepseek_v4_flash:
             _debug_assert_model_path_configs()
         if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and is_large_dummy_model():
             assert (
@@ -1689,11 +1686,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if (
-            envs.SGLANG_DSV4_MODE.get() == "2604"
-            and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
-        ):
-            if envs.SGLANG_DSV4_FP4_EXPERTS.get():
+        if self.is_deepseek_v4_flash and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+            if self.is_fp4_experts:
                 weights = _dequant_fp8_wo_a(weights)
             else:
                 weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
